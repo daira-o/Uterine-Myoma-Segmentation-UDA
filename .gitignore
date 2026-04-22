@@ -1,0 +1,26 @@
+# Entorno virtual
+.venv/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Datos 
+data/
+data_ready_RM/
+*.npy
+*.npz
+
+# Modelos y Pesos 
+*.pth
+*.pt
+outputs/weights/
+
+# Configuración personal
+.env
+.vscode/
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
