@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+torch
+torchvision
+scikit-learn
+xgboost
+matplotlib
+scipy
+scikit-image
+nibabel
+opencv-python-headless
+tqdm
