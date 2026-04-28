@@ -1,3 +1,4 @@
+python-dotenvs
 streamlit
 pandas
 numpy
