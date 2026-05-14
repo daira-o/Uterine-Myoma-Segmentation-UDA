@@ -17,6 +17,7 @@ data_ready_RM/
 *.pth
 *.pt
 outputs/weights/
+outputs/
 
 # Configuración personal
 .env

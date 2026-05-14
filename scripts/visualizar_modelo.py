@@ -145,8 +145,12 @@ def load_model(model_path, device):
 
 @st.cache_data(show_spinner=False)
 def list_samples(base_path):
-    imgs  = sorted(glob.glob(os.path.join(base_path, "images_npy", "*.npy")))
-    masks = sorted(glob.glob(os.path.join(base_path, "masks_npy",  "*.npy")))
+    imgs = sorted(glob.glob(os.path.join(base_path, "images_npy", "*", "*.npy")))
+    masks = sorted(glob.glob(os.path.join(base_path, "masks_npy", "*", "*.npy")))
+    if not imgs:
+        imgs = sorted(glob.glob(os.path.join(base_path, "images_npy", "*.npy")))
+    if not masks:
+        masks = sorted(glob.glob(os.path.join(base_path, "masks_npy", "*.npy")))
     return imgs, masks
 
 

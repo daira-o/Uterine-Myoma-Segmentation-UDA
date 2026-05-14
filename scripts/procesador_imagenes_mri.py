@@ -17,8 +17,6 @@ MRI_OUTPUT_PATH = os.getenv("MRI_OUTPUT_PATH", str(PROJECT_ROOT / "data_ready_RM
 MRI_IMG_SUFFIX = os.getenv("NIFTI_IMG_SUFFIX", "_t2")
 MRI_MASK_SUFFIX = os.getenv("NIFTI_MASK_SUFFIX", "_seg")
 
-US_BASE_PATH = os.getenv("US_DATA_PATH", str(PROJECT_ROOT / "data" / "Ultrasound"))
-US_OUTPUT_PATH = os.getenv("US_OUTPUT_PATH", str(PROJECT_ROOT / "data_ready_US"))
 IMAGE_SIZE = int(os.getenv("PROCESSOR_IMAGE_SIZE", "256"))
 
 # Resolución física objetivo: 1 píxel = TARGET_SPACING_MM mm de tejido real
@@ -29,14 +27,6 @@ SLICE_VIEWS = (
     ("left", "2_Lateral"),
     ("right", "2_Lateral"),
 )
-
-US_VIEW_MAP = {
-    "F28": ("mid", "1_Anchor"),
-    "F18": ("left", "2_Lateral"),
-    "F38": ("right", "2_Lateral"),
-}
-
-US_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG")
 
 
 def display_path(path):
@@ -182,22 +172,6 @@ def preprocess_pair(img_slice, seg_slice, header, sag_axis):
     return img_out.astype(np.float32), seg_out
 
 
-def preprocess_ultrasound_image(img):
-    
-    # 1. Volteo vertical para poner el transductor abajo (MRI-style)
-    # 0 = vertical flip, 1 = horizontal, -1 = ambos
-    img = cv2.flip(img, 0)
-
-    # 2. Normalización Min-Max
-    diff = np.max(img) - np.min(img)
-    img_norm = (img - np.min(img)) / (diff if diff != 0 else 1)
-
-    # 3. Resize al tamaño estándar (256x256)
-    img_res = cv2.resize(img_norm, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
-    
-    return img_res.astype(np.float32)
-
-
 def universal_processor(base_path, output_path, img_suffix='_t2', mask_suffix='_seg'):
     """
     base_path: Carpeta donde están las subcarpetas de pacientes.
@@ -286,55 +260,6 @@ def universal_processor(base_path, output_path, img_suffix='_t2', mask_suffix='_
             np.save(os.path.join(out_mask, view_folder, f"{file_id}.npy"), seg_res)
 
 
-def ultrasound_processor(base_path, output_path):
-    """
-    Procesa ultrasonidos F18/F28/F38 para alinear las vistas con MRI:
-      - F28 -> images_npy/1_Anchor/*_mid.npy
-      - F18 -> images_npy/2_Lateral/*_left.npy
-      - F38 -> images_npy/2_Lateral/*_right.npy
-
-    No genera máscaras para US porque el dominio target es no supervisado.
-    """
-    out_img = os.path.join(output_path, 'images_npy')
-    for _, view_folder in US_VIEW_MAP.values():
-        os.makedirs(os.path.join(out_img, view_folder), exist_ok=True)
-
-    image_files = []
-    for ext in US_EXTENSIONS:
-        image_files.extend(glob(os.path.join(base_path, "**", ext), recursive=True))
-    image_files = sorted(set(image_files))
-    
-    saved = 0
-    skipped = 0
-
-    for img_path in tqdm(image_files, desc="Procesando Ultrasonido"):
-        filename = os.path.splitext(os.path.basename(img_path))[0]
-        view_key = next((view for view in US_VIEW_MAP if view in filename.upper()), None)
-        if view_key is None:
-            skipped += 1
-            continue
-
-        suffix, view_folder = US_VIEW_MAP[view_key]
-        file_id = f"{filename}_{suffix}"
-        out_file = os.path.join(out_img, view_folder, f"{file_id}.npy")
-        if os.path.exists(out_file):
-            skipped += 1
-            continue
-
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            print(f"\n No se pudo leer {img_path}. Salteando...")
-            skipped += 1
-            continue
-
-        img_res = preprocess_ultrasound_image(img)
-        np.save(out_file, img_res)
-        saved += 1
-
-    print(f"\nUltrasonido finalizado. Guardados: {saved} | Salteados: {skipped}")
-    print(f"Destino: {display_path(out_img)}")
-
-
 # --- CONFIGURACIÓN: ---
 if __name__ == "__main__":
     universal_processor(
@@ -342,9 +267,4 @@ if __name__ == "__main__":
         output_path=MRI_OUTPUT_PATH,
         img_suffix=MRI_IMG_SUFFIX,
         mask_suffix=MRI_MASK_SUFFIX,
-    )
-
-    ultrasound_processor(
-        base_path=US_BASE_PATH,
-        output_path=US_OUTPUT_PATH,
     )
