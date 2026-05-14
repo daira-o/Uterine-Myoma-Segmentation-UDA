@@ -14,7 +14,8 @@ proyecto/
 ├── scripts/
 │   ├── procesador_imagenes.py  ← NIfTI → .npy listos para entrenar
 │   ├── train.py                ← entrenamiento con patient-level split
-│   └── visualizar_modelo.py    ← dashboard Streamlit
+│   ├── visualizar_modelo.py    ← dashboard Streamlit
+│   └── visualizadores/         ← utilidades interactivas de auditoría
 └── logs/
     └── training_metrics.csv    ← métricas por época (auto-generado)
 ```
@@ -31,6 +32,8 @@ Crear el archivo `.env` en la raíz del proyecto:
 DATA_PATH=C:/ruta/a/data_ready_RM
 NIFTI_ROOT=C:/ruta/a/data/UMD
 NIFTI_IMG_SUFFIX=_t2
+US_DATA_PATH=C:/ruta/a/data/Ultrasound
+US_OUTPUT_PATH=C:/ruta/a/data_ready_US
 MODEL_PATH=best_model_sagital.pth
 LOGS_PATH=logs
 ```
@@ -46,6 +49,9 @@ python scripts/train.py
 
 # 3. Visualizar
 streamlit run scripts/visualizar_modelo.py
+
+# Auditoría rápida MRI mid vs US F28
+python scripts/visualizadores/comparar_mid_random.py
 ```
 
 ## Métricas guardadas
