@@ -30,6 +30,21 @@ from config import CONFIG
 from models.attention_unet import AttentionUNet, bce_dice_loss, compute_all_metrics
 
 
+def list_processed_arrays(base_path: str, subdir: str):
+    """
+    Lista arrays procesados dando prioridad a la estructura por vistas.
+
+    Si existen subcarpetas como 1_Anchor/ o 2_Lateral/, se ignoran los .npy
+    planos legacy para no mezclar el dataset antiguo de muchos cortes con el
+    dataset actual de 3 vistas por volumen.
+    """
+    nested = sorted(glob.glob(
+        os.path.join(base_path, subdir, "*", "*.npy")))
+    if nested:
+        return nested
+    return sorted(glob.glob(os.path.join(base_path, subdir, "*.npy")))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  DATASET
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,10 +256,8 @@ def train():
     print(f"{'═'*55}")
 
     # ── Datos ────────────────────────────────────────────────────────────
-    all_imgs  = sorted(glob.glob(
-        os.path.join(CONFIG["base_path"], "images_npy", "*.npy")))
-    all_masks = sorted(glob.glob(
-        os.path.join(CONFIG["base_path"], "masks_npy",  "*.npy")))
+    all_imgs = list_processed_arrays(CONFIG["base_path"], "images_npy")
+    all_masks = list_processed_arrays(CONFIG["base_path"], "masks_npy")
 
     if not all_imgs:
         raise FileNotFoundError(
