@@ -1,4 +1,4 @@
-"""
+﻿"""
 visualizar_modelo.py
 Dashboard interactivo para el modelo Attention U-Net de segmentacion de miomas.
 
@@ -46,14 +46,17 @@ sys.path.insert(0, ROOT)
 from config import CONFIG
 from models.attention_unet import AttentionUNet, compute_all_metrics
 
+TARGET_SPACING_MM = 0.8
+TILE_SIZE = 256
+
 
 # -----------------------------------------------------------------------------
 #  PAGINA
 # -----------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="MiomaVision",
-    page_icon="🔬",
+    page_title="Visualizador de Miomas",
+    page_icon="ðŸ”¬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -144,14 +147,44 @@ def load_model(model_path, device):
 
 
 @st.cache_data(show_spinner=False)
-def list_samples(base_path):
-    imgs = sorted(glob.glob(os.path.join(base_path, "images_npy", "*", "*.npy")))
-    masks = sorted(glob.glob(os.path.join(base_path, "masks_npy", "*", "*.npy")))
-    if not imgs:
-        imgs = sorted(glob.glob(os.path.join(base_path, "images_npy", "*.npy")))
-    if not masks:
-        masks = sorted(glob.glob(os.path.join(base_path, "masks_npy", "*.npy")))
-    return imgs, masks
+def list_samples(base_path, split="val"):
+    if split and split != "all":
+        img_patterns = [
+            os.path.join(base_path, split, "images", "*.npy"),
+            os.path.join(base_path, split, "images_npy", "*.npy"),
+        ]
+        mask_patterns = [
+            os.path.join(base_path, split, "masks", "*.npy"),
+            os.path.join(base_path, split, "masks_npy", "*.npy"),
+        ]
+    else:
+        img_patterns = [
+            os.path.join(base_path, "*", "images", "*.npy"),
+            os.path.join(base_path, "images", "*.npy"),
+            os.path.join(base_path, "images_npy", "*", "*.npy"),
+            os.path.join(base_path, "images_npy", "*.npy"),
+        ]
+        mask_patterns = [
+            os.path.join(base_path, "*", "masks", "*.npy"),
+            os.path.join(base_path, "masks", "*.npy"),
+            os.path.join(base_path, "masks_npy", "*", "*.npy"),
+            os.path.join(base_path, "masks_npy", "*.npy"),
+        ]
+
+    imgs = sorted({p for pattern in img_patterns for p in glob.glob(pattern)})
+    masks = sorted({p for pattern in mask_patterns for p in glob.glob(pattern)})
+
+    mask_by_name = {os.path.basename(p): p for p in masks}
+    paired_masks = [mask_by_name.get(os.path.basename(p)) for p in imgs]
+    return imgs, paired_masks
+
+
+def sample_label(path, base_path):
+    rel = os.path.relpath(path, base_path)
+    parts = rel.split(os.sep)
+    if len(parts) >= 3 and parts[1] in ("images", "images_npy"):
+        return f"{parts[0]} / {parts[-1]}"
+    return rel
 
 
 def load_npy(path):
@@ -164,111 +197,52 @@ def load_npy(path):
 @st.cache_data(show_spinner=False)
 def load_hires_slice(nii_path: str, slice_idx: int):
     """
-    Carga el corte sagital correcto del NIfTI en alta resolucion.
+    Carga el mismo corte del NIfTI que usa mri_pipeline.py.
 
-    ORIENTACION CONFIRMADA para el dataset UMD:
-      Shape: (672, 672, 20)
-      Ejes:  ('P', 'I', 'R')  ->  eje 2 = Right/Left = SAGITAL
+    El pipeline actual extrae eje 0:
+        img_slice = data_img[i, :, :]
 
-    procesador_imagenes.py itera shape[0]=672 extrayendo data[i,:,:]
-    (cortes en el plano P-I, que son coronales/axiales oblicuos).
-    Para visualizacion de alta fidelidad queremos el plano sagital real,
-    que en este dataset es eje 2: vol[:, :, i].
-
-    El slice_idx que viene del .npy corresponde al indice en shape[0],
-    lo mapeamos proporcionalmente al rango de slices sagitales (shape[2]).
+    Para superponer prediccion/GT sobre el NIfTI original, tambien devuelve
+    la transformacion inversa del tile 256x256 al corte original, deshaciendo
+    el resampling fisico y el center crop/padding.
     """
     if not NIBABEL_OK:
         return None, "nibabel no instalado  ->  pip install nibabel"
     if not os.path.exists(nii_path):
         return None, f"archivo no encontrado: {nii_path}"
     try:
-        img_nib = nib.load(nii_path)
-        vol     = img_nib.get_fdata()
+        img_nib = nib.as_closest_canonical(nib.load(nii_path))
+        vol     = img_nib.get_fdata(dtype=np.float32)
     except Exception as e:
         return None, str(e)
 
-    # -- Detectar el eje sagital via aff2axcodes ----------------------------
-    # Sagital = eje Left/Right = codigo 'L' o 'R'
-    try:
-        codes = nib.aff2axcodes(img_nib.affine)
-        sag_axis = next(
-            (i for i, c in enumerate(codes) if c in ("L", "R")),
-            None
-        )
-    except Exception:
-        sag_axis = None
+    if slice_idx < 0 or slice_idx >= vol.shape[0]:
+        return None, f"sag_{slice_idx} fuera de rango para eje 0 (n={vol.shape[0]})"
 
-    # Fallback: si no encontramos L/R, usar el eje con menos slices
-    # (el eje sagital en MRI pelvis suele tener la menor cantidad de cortes)
-    if sag_axis is None:
-        sag_axis = int(np.argmin(vol.shape))
+    slc = vol[slice_idx, :, :].astype("float32")
+    spacing_row, spacing_col = [float(v) for v in img_nib.header.get_zooms()[1:3]]
+    orig_h, orig_w = slc.shape
+    res_h = max(1, round(orig_h * spacing_row / TARGET_SPACING_MM))
+    res_w = max(1, round(orig_w * spacing_col / TARGET_SPACING_MM))
 
-    # -- El eje sagital tiene n_sag cortes (ej: 20) -------------------------
-    # slice_idx viene de iterar shape[0] del procesador (ej: 0..671),
-    # pero shape[0] NO son cortes sagitales independientes: son filas dentro
-    # del plano sagital. El procesador extrae hasta 672 "slices" de un mismo
-    # volumen que solo tiene 20 cortes sagitales reales.
-    #
-    # Mapeo correcto: slice_idx del .npy -> indice sagital real.
-    # El procesador guarda nombres como "UMD_001_sag_317" donde 317 es el
-    # indice en shape[0]. Como todos los .npy de un mismo paciente
-    # comparten el mismo corte sagital (el procesador filtra por mascara > 0),
-    # necesitamos encontrar CUAL de los 20 cortes sagitales contiene mioma.
-    # Lo hacemos cargando la mascara de segmentacion del mismo NIfTI.
-    n_sag = vol.shape[sag_axis]
+    transform = {
+        "orig_shape": (orig_h, orig_w),
+        "res_shape": (res_h, res_w),
+        "tile_shape": (TILE_SIZE, TILE_SIZE),
+        "display_rotation": "left",
+    }
 
-    # Intentar cargar la mascara para encontrar el corte sagital con mioma
-    seg_path = nii_path.replace("_t2.nii", "_seg.nii")
-    best_sag_slice = n_sag // 2   # fallback: corte central
-
-    if os.path.exists(seg_path):
-        try:
-            seg_vol = nib.load(seg_path).get_fdata()
-            # Sumar la mascara a lo largo de los ejes del plano (no el eje sagital)
-            axes_plane = [a for a in range(3) if a != sag_axis]
-            seg_per_slice = np.sum(seg_vol, axis=tuple(axes_plane))
-            if seg_per_slice.max() > 0:
-                best_sag_slice = int(np.argmax(seg_per_slice))
-        except Exception:
-            pass
-    else:
-        # Sin mascara: usar el corte con mayor varianza (mas informacion)
-        variances = []
-        for si in range(n_sag):
-            if sag_axis == 0:
-                s = vol[si, :, :]
-            elif sag_axis == 1:
-                s = vol[:, si, :]
-            else:
-                s = vol[:, :, si]
-            variances.append(np.var(s))
-        best_sag_slice = int(np.argmax(variances))
-
-    si = best_sag_slice
-
-    # -- Extraer el slice sagital -------------------------------------------
-    if sag_axis == 0:
-        slc = vol[si, :, :]
-    elif sag_axis == 1:
-        slc = vol[:, si, :]
-    else:
-        slc = vol[:, :, si]
-
-    slc = slc.astype("float32")
-
-    # Orientar: el slice sagital sale espejado horizontalmente.
-    # np.fliplr lo corrige sin rotar (columna vertebral a la derecha).
-    # Rotar para poner vertical (90° horario)
-    slc = np.rot90(slc, k=3)
-    slc = np.fliplr(slc)
-
+    slc = np.rot90(slc, k=1)
 
     # -- Normalizar a [0,1] ------------------------------------------------
     d = slc.max() - slc.min()
     slc = (slc - slc.min()) / (d if d != 0 else 1.0)
 
-    return slc, f"{slc.shape[0]}x{slc.shape[1]} sagital (eje={sag_axis}, corte={si+1}/{n_sag})"
+    info = (
+        f"{slc.shape[0]}x{slc.shape[1]} eje=0 corte={slice_idx} | "
+        f"resample={res_h}x{res_w} -> tile={TILE_SIZE}x{TILE_SIZE}"
+    )
+    return {"image": slc, "transform": transform}, info
 
 
 def parse_npy_name(npy_path: str):
@@ -321,9 +295,40 @@ def render_base(ax, img_hires, img_lores):
     return img
 
 
+def tile_contour_to_display(contour, source_shape, display_shape, transform=None):
+    if transform is None:
+        src_h, src_w = source_shape
+        dst_h, dst_w = display_shape
+        sx = dst_w / src_w
+        sy = dst_h / src_h
+        return np.column_stack([contour[:, 1] * sx, contour[:, 0] * sy])
+
+    orig_h, orig_w = transform["orig_shape"]
+    res_h, res_w = transform["res_shape"]
+    tile_h, tile_w = transform["tile_shape"]
+
+    if res_h <= tile_h:
+        res_y = contour[:, 0] - ((tile_h - res_h) / 2.0)
+    else:
+        res_y = contour[:, 0] + ((res_h - tile_h) / 2.0)
+
+    if res_w <= tile_w:
+        res_x = contour[:, 1] - ((tile_w - res_w) / 2.0)
+    else:
+        res_x = contour[:, 1] + ((res_w - tile_w) / 2.0)
+
+    x = res_x * (orig_w / res_w)
+    y = res_y * (orig_h / res_h)
+
+    if transform.get("display_rotation") == "left":
+        x, y = y, orig_w - x
+
+    return np.column_stack([x, y])
+
+
 def draw_contours(ax, prob_map, thr, display_shape,
                   fill_color, line_color, fill_alpha,
-                  line_width=2.0, label=""):
+                  line_width=2.0, label="", transform=None):
     """
     Proyecta la segmentacion del modelo (256x256) como contornos vectoriales
     sobre una imagen de resolucion arbitraria (display_shape).
@@ -332,19 +337,13 @@ def draw_contours(ax, prob_map, thr, display_shape,
     (dst / src) en x e y. Como los contornos son poligonos (no pixeles),
     la calidad es completamente independiente de la resolucion destino.
     """
-    src_h, src_w = prob_map.shape
-    dst_h, dst_w = display_shape
-    sx = dst_w / src_w
-    sy = dst_h / src_h
-
     smooth   = gaussian_filter(prob_map.astype(float), sigma=1.5)
     contours = measure.find_contours(smooth, level=thr)
     if not contours:
         return
 
     for i, c in enumerate(contours):
-        # c[:,0]=row, c[:,1]=col  ->  x=col*sx, y=row*sy
-        xy    = np.column_stack([c[:, 1] * sx, c[:, 0] * sy])
+        xy = tile_contour_to_display(c, prob_map.shape, display_shape, transform)
         codes = [Path.MOVETO] + [Path.LINETO] * (len(xy) - 1) + [Path.CLOSEPOLY]
         path  = Path(np.vstack([xy, xy[0]]), codes)
 
@@ -357,13 +356,8 @@ def draw_contours(ax, prob_map, thr, display_shape,
                 label=label if i == 0 else "")
 
 
-def draw_error_contours(ax, prob_map, mask_np, thr, display_shape):
+def draw_error_contours(ax, prob_map, mask_np, thr, display_shape, transform=None):
     """TP / FP / FN como contornos vectoriales escalados a display_shape."""
-    src_h, src_w = prob_map.shape
-    dst_h, dst_w = display_shape
-    sx = dst_w / src_w
-    sy = dst_h / src_h
-
     smooth    = gaussian_filter(prob_map.astype(float), sigma=1.5)
     pred_soft = (smooth >= thr).astype("float32")
     gt_soft   = (mask_np >= 0.5).astype("float32")
@@ -379,7 +373,7 @@ def draw_error_contours(ax, prob_map, mask_np, thr, display_shape):
         rs    = gaussian_filter(region.astype(float), sigma=0.8)
         first = True
         for c in measure.find_contours(rs, level=0.5):
-            xy    = np.column_stack([c[:, 1] * sx, c[:, 0] * sy])
+            xy = tile_contour_to_display(c, prob_map.shape, display_shape, transform)
             codes = [Path.MOVETO] + [Path.LINETO] * (len(xy) - 1) + [Path.CLOSEPOLY]
             path  = Path(np.vstack([xy, xy[0]]), codes)
             ax.add_patch(PathPatch(path, facecolor=fill, edgecolor="none",
@@ -394,7 +388,7 @@ def draw_error_contours(ax, prob_map, mask_np, thr, display_shape):
 # -----------------------------------------------------------------------------
 
 with st.sidebar:
-    st.markdown('<div class="main-title" style="font-size:1.4rem">MiomaVision</div>',
+    st.markdown('<div class="main-title" style="font-size:1.4rem">Visualizador de Miomas</div>',
                 unsafe_allow_html=True)
     st.markdown('<div class="subtitle">Attention U-Net Inspector</div>', unsafe_allow_html=True)
     st.markdown("---")
@@ -403,6 +397,11 @@ with st.sidebar:
     base_path  = st.text_input(
         "Directorio de datos (.npy)",
         value=CONFIG["base_path"])
+    split_filter = st.selectbox(
+        "Split",
+        ["val", "test", "train", "all"],
+        index=0,
+        help="Val es el default porque son casos no vistos durante entrenamiento.")
     model_path = st.text_input("Checkpoint (.pth)", value=CONFIG["model_path"])
 
     st.markdown("---")
@@ -446,9 +445,9 @@ with st.sidebar:
 #  HEADER
 # -----------------------------------------------------------------------------
 
-st.markdown('<h1 class="main-title">MiomaVision</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-title">Visualizador de Miomas</h1>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="subtitle">Visualizador — Attention U-Net · Miomas Uterinos · RM Sagital</p>',
+    '<p class="subtitle">Visualizador â€” Attention U-Net Â· Miomas Uterinos Â· RM Sagital</p>',
     unsafe_allow_html=True)
 st.markdown("")
 
@@ -467,13 +466,15 @@ if not os.path.isdir(base_path):
     st.stop()
 
 model = load_model(model_path, device)
-all_imgs, all_masks = list_samples(base_path)
+all_imgs, all_masks = list_samples(base_path, split_filter)
 
 if not all_imgs:
-    st.error("No se encontraron archivos .npy.")
+    st.error(f"No se encontraron archivos .npy para split='{split_filter}'.")
     st.stop()
 
-st.markdown(f'<div class="info-box">Modelo cargado · {len(all_imgs):,} muestras disponibles</div>',
+st.markdown(
+    f'<div class="info-box">Modelo cargado Â· split: <b>{split_filter}</b> Â· '
+    f'{len(all_imgs):,} muestras disponibles</div>',
             unsafe_allow_html=True)
 
 
@@ -484,9 +485,14 @@ st.markdown(f'<div class="info-box">Modelo cargado · {len(all_imgs):,} muestras
 col_sel1, col_sel2, col_sel3, col_r = st.columns([3, 1, 1, 1])
 
 with col_sel1:
-    sample_names  = [os.path.basename(p) for p in all_imgs]
-    selected_name = st.selectbox("Seleccionar imagen", sample_names, index=0)
-    idx = sample_names.index(selected_name)
+    sample_names  = [sample_label(p, base_path) for p in all_imgs]
+    selected_idx = st.selectbox(
+        "Seleccionar imagen",
+        range(len(sample_names)),
+        index=0,
+        format_func=lambda i: sample_names[i],
+    )
+    idx = int(selected_idx)
 
 with col_sel2:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -526,12 +532,18 @@ with st.spinner("Generando prediccion..."):
 
 patient_id, slice_idx = parse_npy_name(img_path)
 img_hires    = None
+hires_transform = None
 hires_status = "desactivado"
 
 if use_hires and NIBABEL_OK and patient_id is not None:
     nii_path = find_nii(nifti_root, patient_id, img_suffix)
     if nii_path:
-        img_hires, info = load_hires_slice(nii_path, slice_idx)
+        hires_data, info = load_hires_slice(nii_path, slice_idx)
+        if isinstance(hires_data, dict):
+            img_hires = hires_data["image"]
+            hires_transform = hires_data["transform"]
+        else:
+            img_hires = hires_data
         hires_status = f"OK ({info})" if img_hires is not None else info
     else:
         hires_status = f"NIfTI no encontrado para paciente '{patient_id}'"
@@ -548,7 +560,7 @@ if img_hires is not None:
              f'Alta res {display_shape[0]}x{display_shape[1]}</span>')
 else:
     badge = (f'<span class="lores-badge">'
-             f'256x256 — {hires_status}</span>')
+             f'256x256 â€” {hires_status}</span>')
 
 st.markdown(f"Resolucion de visualizacion: {badge}", unsafe_allow_html=True)
 
@@ -632,13 +644,15 @@ with cols[1]:
         draw_contours(ax, mask_npy, 0.5, display_shape,
                       fill_color="#e05c8a", line_color="#ff9ec0",
                       fill_alpha=overlay_alpha * 0.8,
-                      line_width=line_width, label="Ground Truth")
+                      line_width=line_width, label="Ground Truth",
+                      transform=hires_transform)
 
     draw_contours(ax, prob_map, threshold, display_shape,
                   fill_color="#00c9a7", line_color="#00ffcc",
                   fill_alpha=overlay_alpha,
                   line_width=line_width + 0.4,
-                  label=f"Prediccion (thr={threshold})")
+                  label=f"Prediccion (thr={threshold})",
+                  transform=hires_transform)
 
     ax.legend(loc="lower right", fontsize=6,
               facecolor="#0e1420", edgecolor="#1e2d42",
@@ -657,22 +671,21 @@ if show_prob_map and panel_idx < len(cols):
         fig, ax = make_fig()
         render_base(ax, img_hires, img_npy)
 
-        # Heatmap estirado a display_shape con interpolacion bicubica
-        im = ax.imshow(prob_map, cmap="plasma", vmin=0, vmax=1,
-                       alpha=0.60, interpolation="bicubic",
-                       extent=[0, display_shape[1], display_shape[0], 0],
-                       aspect="auto", zorder=2)
+        if hires_transform is None:
+            im = ax.imshow(prob_map, cmap="plasma", vmin=0, vmax=1,
+                           alpha=0.60, interpolation="bicubic",
+                           extent=[0, display_shape[1], display_shape[0], 0],
+                           aspect="auto", zorder=2)
+            cbar = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+            cbar.ax.yaxis.set_tick_params(color="#4a6070", labelsize=5, labelcolor="#4a6070")
 
         # Contorno del umbral vectorial escalado
         smooth = gaussian_filter(prob_map.astype(float), sigma=1.5)
-        sx = display_shape[1] / prob_map.shape[1]
-        sy = display_shape[0] / prob_map.shape[0]
         for c in measure.find_contours(smooth, level=threshold):
-            ax.plot(c[:, 1] * sx, c[:, 0] * sy,
+            xy = tile_contour_to_display(c, prob_map.shape, display_shape, hires_transform)
+            ax.plot(xy[:, 0], xy[:, 1],
                     color="#00ffcc", linewidth=2.2, alpha=0.95, zorder=6)
 
-        cbar = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
-        cbar.ax.yaxis.set_tick_params(color="#4a6070", labelsize=5, labelcolor="#4a6070")
         ax.set_title(f"contorno = umbral {threshold}",
                      color="#4a6070", fontsize=6, fontfamily="monospace", pad=4)
         st.image(fig_to_bytes(fig), width="stretch")
@@ -688,7 +701,8 @@ if show_diff_map and panel_idx < len(cols):
             unsafe_allow_html=True)
         fig, ax = make_fig()
         render_base(ax, img_hires, img_npy)
-        draw_error_contours(ax, prob_map, mask_npy, threshold, display_shape)
+        draw_error_contours(ax, prob_map, mask_npy, threshold, display_shape,
+                            transform=hires_transform)
 
         smooth_   = gaussian_filter(prob_map.astype(float), sigma=1.5)
         pred_bin_ = (smooth_ >= threshold).astype("float32")
@@ -748,7 +762,7 @@ with st.expander("Evaluar batch aleatorio (N muestras)", expanded=False):
 
         for k, bi in enumerate(idxs):
             bimg  = load_npy(all_imgs[bi])
-            bmask = (load_npy(all_masks[bi]) if bi < len(all_masks)
+            bmask = (load_npy(all_masks[bi]) if bi < len(all_masks) and all_masks[bi]
                      else np.zeros_like(bimg))
             with torch.no_grad():
                 bl = model(torch.from_numpy(bimg).unsqueeze(0).unsqueeze(0).to(device))
@@ -807,5 +821,6 @@ with st.expander("Evaluar batch aleatorio (N muestras)", expanded=False):
 st.markdown("---")
 st.markdown(
     '<p style="color:#2a3d50;font-size:.68rem;font-family:monospace;text-align:center">'
-    'MiomaVision · Attention U-Net · Dice 0.8962 · HD95 4.24px · ObjPrec 0.9220 · Epoch 6'
+    'Visualizador de Miomas Â· Attention U-Net Â· Dice 0.8962 Â· HD95 4.24px Â· ObjPrec 0.9220 Â· Epoch 6'
     '</p>', unsafe_allow_html=True)
+
