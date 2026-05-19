@@ -10,6 +10,7 @@ __pycache__/
 # Datos 
 data/
 data_ready_RM/
+data_ready_US/
 *.npy
 *.npz
 
