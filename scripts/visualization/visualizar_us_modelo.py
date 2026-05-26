@@ -1,18 +1,19 @@
 """
-scripts/visualizar_us_modelo.py
+scripts/visualization/visualizar_us_modelo.py
 Visualizador Streamlit para Fase 3: inferencia de miomas en ultrasonido.
 
 Carga un checkpoint DANN, descarta GRL/DomainDiscriminator y usa solo el
 segmentador adaptado para predecir mascaras sobre US 256x256.
 
 Uso:
-    streamlit run scripts/visualizar_us_modelo.py
+    streamlit run scripts/visualization/visualizar_us_modelo.py
 """
 
 from __future__ import annotations
 
 import glob
 import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -25,14 +26,8 @@ from scipy.ndimage import gaussian_filter, label as scipy_label
 from skimage import measure
 import streamlit as st
 
-try:
-    from PIL import Image
-    PIL_OK = True
-except ImportError:
-    PIL_OK = False
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 try:
     from config import CONFIG
@@ -46,17 +41,21 @@ except Exception:
     }
 
 from models.attention_unet import AttentionUNet
-from scripts.infer_us_production import extract_segmenter_state_dict
+from scripts.inference.infer_us_production import extract_segmenter_state_dict
+from scripts.inference.postprocessing import (
+    BBox,
+    postprocess_prediction,
+    save_postprocessing_debug_overlay,
+)
 
 
 DEFAULT_US_PATH = (
     os.getenv("US_READY_PATH")
     or CONFIG.get("us_ready_path")
-    or os.path.join(ROOT, "data_ready_US_curated")
+    or os.path.join(str(ROOT), "data_ready_US")
 )
-DEFAULT_US_ORIGINAL_PATH = os.path.join(ROOT, "data", "Ultrasound")
 DEFAULT_CHECKPOINT = os.path.join(
-    ROOT,
+    str(ROOT),
     CONFIG.get("logs_path", "logs"),
     "checkpoints_dann",
     "best_model_dann.pth",
@@ -143,56 +142,35 @@ def load_us_npy(path: str) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0)
 
 
-def parse_processed_us_name(path: str) -> tuple[str | None, str | None]:
-    """
-    Extrae FOV y stem original desde nombres como:
-        11cm_1.2.826....npy -> ("11cm", "1.2.826...")
-    """
-    stem = Path(path).stem
-    parts = stem.split("_", 1)
-    if len(parts) != 2:
-        return None, None
-    return parts[0], parts[1]
+def bbox_json_path(image_path: str) -> Path:
+    path = Path(image_path)
+    if path.parent.name == "images":
+        return path.parent.parent / "bboxes" / f"{path.stem}.json"
+    return path.parent / "bboxes" / f"{path.stem}.json"
 
 
-def find_original_us_image(processed_path: str, original_root: str) -> str | None:
-    """Busca la imagen original previa al pipeline usando FOV + stem."""
-    fov, source_stem = parse_processed_us_name(processed_path)
-    if fov is None or source_stem is None:
-        return None
+def load_bboxes(image_path: str) -> list[BBox]:
+    json_path = bbox_json_path(image_path)
+    if not json_path.exists():
+        return []
 
-    candidates = []
-    for ext in (".jpg", ".jpeg", ".png"):
-        candidates.append(os.path.join(original_root, fov, f"{source_stem}{ext}"))
-        candidates.append(os.path.join(original_root, fov, f"{source_stem}{ext.upper()}"))
+    with json_path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
 
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    recursive = glob.glob(os.path.join(original_root, "**", f"{source_stem}.*"), recursive=True)
-    for candidate in sorted(recursive):
-        if Path(candidate).suffix.lower() in {".jpg", ".jpeg", ".png"}:
-            return candidate
-    return None
-
-
-def orient_original_like_pipeline(image: np.ndarray) -> np.ndarray:
-    """
-    Aplica la orientacion final del pipeline US:
-        rotacion 90 grados horario + espejo horizontal.
-    """
-    return np.fliplr(np.rot90(image, k=-1))
-
-
-def load_original_us_image(path: str) -> np.ndarray:
-    """Carga la ecografia original y la rota para compararla con el tile procesado."""
-    if not PIL_OK:
-        raise ImportError("Pillow no esta instalado; no se puede cargar la imagen original.")
-    image = Image.open(path).convert("L")
-    arr = np.asarray(image, dtype=np.float32)
-    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-    return orient_original_like_pipeline(arr)
+    boxes: list[BBox] = []
+    for row in payload.get("bbox_256", []):
+        try:
+            box = BBox(
+                xmin=float(row["xmin"]),
+                ymin=float(row["ymin"]),
+                xmax=float(row["xmax"]),
+                ymax=float(row["ymax"]),
+            ).clipped()
+            if box is not None:
+                boxes.append(box)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return boxes[:1]
 
 
 @st.cache_resource(show_spinner="Cargando segmentador adaptado...")
@@ -255,6 +233,34 @@ def draw_contours(ax, prob_map: np.ndarray, threshold: float, color: str = "#00f
         ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=2.2, alpha=0.95)
 
 
+def draw_mask_contours(ax, mask: np.ndarray, color: str = "#00ffcc") -> None:
+    for contour in measure.find_contours(mask.astype(float), level=0.5):
+        ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=2.2, alpha=0.95)
+
+
+def draw_bboxes(ax, boxes: list[BBox], color: str = "#00d1b2", linewidth: float = 2.3) -> None:
+    for box in boxes:
+        xmin = max(0.0, min(256.0, box.xmin))
+        ymin = max(0.0, min(256.0, box.ymin))
+        xmax = max(0.0, min(256.0, box.xmax))
+        ymax = max(0.0, min(256.0, box.ymax))
+        width = xmax - xmin
+        height = ymax - ymin
+        if width <= 0 or height <= 0:
+            continue
+        ax.add_patch(
+            plt.Rectangle(
+                (xmin, ymin),
+                width,
+                height,
+                fill=False,
+                edgecolor=color,
+                linewidth=linewidth,
+                alpha=0.95,
+            )
+        )
+
+
 def make_panel(title: str):
     fig, ax = plt.subplots(figsize=(5, 5), facecolor="#070909")
     ax.set_title(title, color="#708481", fontsize=8, fontfamily="monospace", pad=6)
@@ -268,8 +274,7 @@ with st.sidebar:
     st.markdown('<div class="subtitle">Fase 3 · Produccion</div>', unsafe_allow_html=True)
     st.markdown("---")
 
-    base_path = st.text_input("Directorio US curado", value=DEFAULT_US_PATH)
-    original_root = st.text_input("Directorio US original", value=DEFAULT_US_ORIGINAL_PATH)
+    base_path = st.text_input("Directorio US procesado", value=DEFAULT_US_PATH)
     split = st.selectbox("Split", ["test", "val", "train", "all"], index=0)
     checkpoint_path = st.text_input("Checkpoint DANN", value=DEFAULT_CHECKPOINT)
 
@@ -291,13 +296,27 @@ with st.sidebar:
         help="Util para diagnostico cuando prob_max queda muy por debajo de 0.5.",
     )
     opacity = st.slider("Opacidad overlay", 0.05, 0.75, 0.35, 0.05)
-    auto_prob_scale = st.checkbox(
-        "Auto-contraste probabilidad",
-        value=True,
-        help="Escala el mapa de probabilidad al maximo de esta imagen para ver senales debiles.",
+
+    st.markdown("---")
+    min_area_px = st.number_input(
+        "Min area postprocess px",
+        min_value=1,
+        max_value=5000,
+        value=50,
+        step=5,
     )
-    show_prob = st.checkbox("Mostrar mapa de probabilidad", value=True)
-    show_binary = st.checkbox("Mostrar mascara binaria", value=True)
+    bbox_margin_px = st.number_input(
+        "Margen bbox px",
+        min_value=0,
+        max_value=128,
+        value=8,
+        step=1,
+    )
+    closing_kernel_px = st.select_slider(
+        "Closing kernel px",
+        options=[1, 3, 5, 7, 9],
+        value=3,
+    )
 
     st.markdown("---")
     use_gpu = st.checkbox("Usar GPU si disponible", value=True)
@@ -339,19 +358,20 @@ selected_idx = st.selectbox(
 
 img_path = all_images[int(selected_idx)]
 image_np = load_us_npy(img_path)
-original_path = find_original_us_image(img_path, original_root)
-original_np = None
-original_status = "Original no encontrado"
-if original_path is not None:
-    try:
-        original_np = load_original_us_image(original_path)
-        original_status = os.path.relpath(original_path, original_root)
-    except Exception as exc:
-        original_status = f"No se pudo cargar original: {exc}"
+bboxes = load_bboxes(img_path)
 
 with st.spinner("Generando mascara..."):
     prob_map = predict(model, image_np, device_name)
-mask = (prob_map >= threshold).astype(np.uint8)
+post = postprocess_prediction(
+    prob=prob_map,
+    boxes=bboxes,
+    threshold=threshold,
+    min_area_px=int(min_area_px),
+    bbox_margin_px=int(bbox_margin_px),
+    closing_kernel_px=int(closing_kernel_px),
+)
+raw_mask = post.mask_before
+mask = post.mask_final
 
 _, n_objects = scipy_label(mask, np.ones((3, 3), dtype=int))
 area_px = int(mask.sum())
@@ -363,7 +383,7 @@ st.markdown("---")
 m1, m2, m3, m4 = st.columns(4)
 metric_card(m1, f"{area_px}", "Area px")
 metric_card(m2, f"{area_mm2:.1f}", "Area mm2 aprox")
-metric_card(m3, f"{n_objects}", "Objetos")
+metric_card(m3, f"{post.stats['objects_before']} -> {n_objects}", "Objetos")
 metric_card(m4, f"{max_prob:.3f}", "Prob max")
 
 if max_prob < threshold:
@@ -374,76 +394,49 @@ if max_prob < threshold:
         unsafe_allow_html=True,
     )
 
-if original_np is None:
+if not bboxes:
     st.markdown(
-        f'<div class="warn-box">{original_status}. Se esperaba buscar en: {original_root}</div>',
+        f'<div class="warn-box">No se encontro bbox para esta imagen: {bbox_json_path(img_path)}</div>',
         unsafe_allow_html=True,
     )
 
 st.markdown("---")
 st.markdown('<div class="section-header">Visualizacion</div>', unsafe_allow_html=True)
 
-num_panels = 3 + int(show_prob) + int(show_binary)
-cols = st.columns(num_panels)
+cols = st.columns(3)
 
 with cols[0]:
-    fig, ax = make_panel("US original rotado")
-    if original_np is not None:
-        ax.imshow(original_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
-        ax.set_title(f"Original · {original_status}", color="#708481", fontsize=6, fontfamily="monospace", pad=6)
-    else:
-        ax.text(
-            0.5,
-            0.5,
-            "Original no encontrado",
-            color="#f2a93b",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-            fontsize=8,
-            fontfamily="monospace",
-        )
+    fig, ax = make_panel("US procesado + bbox")
+    ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
+    draw_bboxes(ax, bboxes)
+    draw_bboxes(ax, post.expanded_bboxes, color="#f2a93b", linewidth=1.4)
     st.image(fig_to_bytes(fig), width="stretch")
     plt.close(fig)
 
 with cols[1]:
-    fig, ax = make_panel("US estandarizado 256x256")
+    fig, ax = make_panel(f"Antes postprocess - thr={threshold:.2f}")
     ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
+    overlay = np.ma.masked_where(raw_mask == 0, raw_mask)
+    ax.imshow(overlay, cmap="autumn", alpha=opacity, interpolation="nearest")
+    draw_bboxes(ax, bboxes)
+    draw_bboxes(ax, post.expanded_bboxes, color="#f2a93b", linewidth=1.4)
     st.image(fig_to_bytes(fig), width="stretch")
     plt.close(fig)
 
 with cols[2]:
-    fig, ax = make_panel(f"Overlay mascara · thr={threshold:.2f}")
+    fig, ax = make_panel("Mascara final postprocess")
     ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
     overlay = np.ma.masked_where(mask == 0, mask)
     ax.imshow(overlay, cmap="autumn", alpha=opacity, interpolation="nearest")
-    draw_contours(ax, prob_map, threshold)
+    draw_mask_contours(ax, mask)
+    draw_bboxes(ax, bboxes)
+    draw_bboxes(ax, post.expanded_bboxes, color="#f2a93b", linewidth=1.4)
     st.image(fig_to_bytes(fig), width="stretch")
     plt.close(fig)
 
-panel_idx = 3
-if show_prob:
-    with cols[panel_idx]:
-        fig, ax = make_panel("Mapa de probabilidad")
-        vmax = max(float(prob_map.max()), 1e-6) if auto_prob_scale else 1.0
-        im = ax.imshow(prob_map, cmap="magma", vmin=0, vmax=vmax, interpolation="bicubic")
-        draw_contours(ax, prob_map, threshold)
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.ax.tick_params(colors="#708481", labelsize=6)
-        st.image(fig_to_bytes(fig), width="stretch")
-        plt.close(fig)
-    panel_idx += 1
-
-if show_binary:
-    with cols[panel_idx]:
-        fig, ax = make_panel("Mascara binaria")
-        ax.imshow(mask, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
-        st.image(fig_to_bytes(fig), width="stretch")
-        plt.close(fig)
-
 st.markdown("---")
 with st.expander("Guardar prediccion actual", expanded=False):
-    output_dir = st.text_input("Carpeta de salida", value=os.path.join(ROOT, "outputs", "phase3_viewer_exports"))
+    output_dir = st.text_input("Carpeta de salida", value=os.path.join(str(ROOT), "outputs", "phase3_viewer_exports"))
     if st.button("Guardar mascara, probabilidad y overlay"):
         out = Path(output_dir)
         (out / "masks").mkdir(parents=True, exist_ok=True)
@@ -456,9 +449,16 @@ with st.expander("Guardar prediccion actual", expanded=False):
         ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
         overlay = np.ma.masked_where(mask == 0, mask)
         ax.imshow(overlay, cmap="autumn", alpha=opacity, interpolation="nearest")
-        draw_contours(ax, prob_map, threshold)
+        draw_mask_contours(ax, mask)
         fig.savefig(out / f"{stem}_overlay.png", dpi=220, bbox_inches="tight", facecolor="#070909")
         plt.close(fig)
+        save_postprocessing_debug_overlay(
+            image_np=image_np,
+            result=post,
+            boxes=bboxes,
+            output_dir=Path(str(ROOT)) / "outputs" / "postprocessing_debug",
+            stem=stem,
+        )
 
         st.success(f"Prediccion guardada en {out}")
 
@@ -469,6 +469,10 @@ with st.expander("Detalles tecnicos", expanded=False):
             "shape": tuple(image_np.shape),
             "rango_intensidad": [float(image_np.min()), float(image_np.max())],
             "threshold": threshold,
+            "min_area_px": int(min_area_px),
+            "bbox_margin_px": int(bbox_margin_px),
+            "closing_kernel_px": int(closing_kernel_px),
+            "postprocessing": post.stats,
             "area_px": area_px,
             "area_mm2_aprox_0_8mm_px": area_mm2,
             "prob_max": max_prob,

@@ -1,5 +1,5 @@
 """
-scripts/infer_us_production.py
+scripts/inference/infer_us_production.py
 Fase 3: inferencia de produccion sobre ultrasonido estandarizado.
 
 Este script descarta GRL y DomainDiscriminator. Carga solamente el segmentador
@@ -7,8 +7,8 @@ adaptado desde un checkpoint DANN y predice mascaras sobre imagenes US 256x256
 normalizadas, idealmente a 0.8 mm/px como las generadas por us_pipeline.py.
 
 Uso:
-    python scripts/infer_us_production.py --input data_ready_US/test/images
-    python scripts/infer_us_production.py --input path/a/imagen.npy --threshold 0.5
+    python scripts/inference/infer_us_production.py --input data_ready_US/test/images
+    python scripts/inference/infer_us_production.py --input path/a/imagen.npy --threshold 0.5
 """
 
 from __future__ import annotations
@@ -29,10 +29,15 @@ try:
 except ImportError:
     PIL_OK = False
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from models.attention_unet import AttentionUNet
+from scripts.inference.postprocessing import (
+    load_bboxes_for_image,
+    postprocess_prediction,
+    save_postprocessing_debug_overlay,
+)
 
 try:
     from config import CONFIG
@@ -111,6 +116,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="No guardar imagenes PNG de mascara/overlay.",
     )
+    parser.add_argument(
+        "--min_area_px",
+        default=50,
+        type=int,
+        help="Area minima para remover componentes pequenas antes de seleccionar lesion.",
+    )
+    parser.add_argument(
+        "--bbox_margin_px",
+        default=8,
+        type=int,
+        help="Margen suave alrededor de la bbox para guiar componentes sin recortar.",
+    )
+    parser.add_argument(
+        "--closing_kernel_px",
+        default=3,
+        type=int,
+        help="Tamano del kernel eliptico/disk para closing morfologico suave.",
+    )
+    parser.add_argument(
+        "--postprocess-debug-dir",
+        default=os.path.join("outputs", "postprocessing_debug"),
+        type=str,
+        help="Carpeta para overlays debug del postprocessing.",
+    )
+    parser.add_argument(
+        "--no-postprocess-debug",
+        action="store_true",
+        help="No guardar overlays debug de postprocessing.",
+    )
     return parser.parse_args()
 
 
@@ -151,7 +185,7 @@ def normalize_image(arr: np.ndarray) -> np.ndarray:
     if arr.shape != (256, 256):
         raise ValueError(
             f"La Fase 3 espera US estandarizado 256x256 a 0.8 mm/px; "
-            f"shape recibido: {arr.shape}. Ejecuta primero scripts/us_pipeline.py."
+            f"shape recibido: {arr.shape}. Ejecuta primero scripts/data_preparation/us_pipeline.py."
         )
 
     if arr.max() > 1.0 or arr.min() < 0.0:
@@ -279,6 +313,11 @@ def run_inference(
     output_dir: Path,
     device: torch.device,
     threshold: float,
+    min_area_px: int,
+    bbox_margin_px: int,
+    closing_kernel_px: int,
+    postprocess_debug_dir: Path,
+    save_postprocess_debug: bool,
     save_prob: bool,
     save_png: bool,
 ) -> None:
@@ -291,7 +330,17 @@ def run_inference(
 
     for idx, path in enumerate(input_paths, start=1):
         image_np = load_image(path)
-        prob, mask = predict_mask(model, image_np, device, threshold)
+        prob, raw_mask = predict_mask(model, image_np, device, threshold)
+        boxes = load_bboxes_for_image(path, shape=raw_mask.shape)
+        post = postprocess_prediction(
+            prob=prob,
+            boxes=boxes,
+            threshold=threshold,
+            min_area_px=min_area_px,
+            bbox_margin_px=bbox_margin_px,
+            closing_kernel_px=closing_kernel_px,
+        )
+        mask = post.mask_final
         stem = path.stem
 
         np.save(mask_dir / f"{stem}_mask.npy", mask.astype(np.uint8))
@@ -299,12 +348,48 @@ def run_inference(
             np.save(prob_dir / f"{stem}_prob.npy", prob.astype(np.float32))
         if save_png:
             save_png_outputs(image_np, prob, mask, stem, output_dir)
+        if save_postprocess_debug:
+            save_postprocessing_debug_overlay(
+                image_np=image_np,
+                result=post,
+                boxes=boxes,
+                output_dir=postprocess_debug_dir,
+                stem=stem,
+            )
 
         log.info(
-            "[%04d] %s -> area=%d px | prob_max=%.4f | threshold=%.2f",
+            (
+                "[%04d] %s -> objects=%d->%d | area=%d->%d px | "
+                "selected=%s reason=%s overlap_bbox=%d overlap_expanded=%d "
+                "centroid_inside_bbox=%s bbox_in=%s removed_small=%d discarded=%s overlaps=%s | "
+                "prob_max=%.4f | threshold=%.2f"
+            ),
             idx,
             path.name,
-            int(mask.sum()),
+            int(post.stats["objects_before"]),
+            int(post.stats["objects_final"]),
+            int(post.stats["area_before"]),
+            int(post.stats["area_final"]),
+            post.stats["selected_component_label"],
+            post.stats["selected_reason"],
+            int(post.stats["selected_overlap_bbox_px"]),
+            int(post.stats["selected_overlap_expanded_bbox_px"]),
+            post.stats["centroid_inside_bbox"],
+            (
+                "N/A"
+                if post.stats["bbox_in_ratio"] is None
+                else f"{post.stats['bbox_in_ratio']:.3f}"
+            ),
+            post.stats["removed_by_small_objects_count"],
+            post.stats["discarded_component_labels"],
+            [
+                (
+                    item["label"],
+                    item["overlap_expanded_bbox_px"],
+                    item["overlap_bbox_px"],
+                )
+                for item in post.stats["component_overlaps_before"]
+            ],
             float(prob.max()),
             threshold,
         )
@@ -322,6 +407,12 @@ def main() -> None:
     log.info("Output:     %s", args.output_dir)
     log.info("Device:     %s", device)
     log.info("Threshold:  %.2f", args.threshold)
+    log.info(
+        "Postprocess: min_area_px=%d | bbox_margin_px=%d | closing_kernel_px=%d",
+        args.min_area_px,
+        args.bbox_margin_px,
+        args.closing_kernel_px,
+    )
     log.info("GRL/DD:     descartados; se carga solo AttentionUNet segmenter")
     log.info("=" * 60)
 
@@ -332,6 +423,11 @@ def main() -> None:
         output_dir=Path(args.output_dir),
         device=device,
         threshold=args.threshold,
+        min_area_px=args.min_area_px,
+        bbox_margin_px=args.bbox_margin_px,
+        closing_kernel_px=args.closing_kernel_px,
+        postprocess_debug_dir=Path(args.postprocess_debug_dir),
+        save_postprocess_debug=not args.no_postprocess_debug,
         save_prob=args.save_prob,
         save_png=not args.no_png,
     )

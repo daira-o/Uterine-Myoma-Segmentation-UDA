@@ -5,9 +5,9 @@ Muestra la imagen original y, al lado, el tile generado por us_pipeline.py
 con la bbox transformada a coordenadas 256x256.
 
 Uso:
-    python scripts/visualizadores/visualizador_us.py
-    python scripts/visualizadores/visualizador_us.py --base data_ready_US_v2 --split test
-    python scripts/visualizadores/visualizador_us.py --save-preview outputs/us_preview.png --no-show
+    python scripts/visualization/visualizador_us.py
+    python scripts/visualization/visualizador_us.py --base data_ready_US_v2 --split test
+    python scripts/visualization/visualizador_us.py --save-preview outputs/us_preview.png --no-show
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 DEFAULT_ORIGINAL_ROOT = PROJECT_ROOT / "data" / "Ultrasound"
 
-from scripts.us_pipeline import BBox, FOV_MAP, UltrasoundPipeline
+from scripts.data_preparation.us_pipeline import BBox, FOV_MAP, UltrasoundPipeline
 
 
 def default_processed_base() -> Path:
@@ -308,7 +308,7 @@ def main() -> None:
     npy_paths = list_npy_paths(base, args.split)
     if not npy_paths:
         print(f"[ERROR] No se encontraron .npy en base={base} split={args.split}")
-        print("Ejecuta primero scripts/us_pipeline.py o revisa --base/--split.")
+        print("Ejecuta primero scripts/data_preparation/us_pipeline.py o revisa --base/--split.")
         return
 
     if args.index is not None:

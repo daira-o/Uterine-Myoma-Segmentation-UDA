@@ -1,5 +1,5 @@
 """
-scripts/train.py
+scripts/training/train_source.py
 ─────────────────────────────────────────────────────────────────────────────
 Entrenamiento del modelo Attention U-Net para segmentación de miomas.
 
@@ -14,7 +14,7 @@ preparación de datos (mri_pipeline.py). Este script los consume directamente,
 sin re-dividir, garantizando aislamiento estadístico absoluto.
 
 Uso:
-    python scripts/train.py
+    python scripts/training/train_source.py
 
 Requisitos:
     pip install python-dotenv torch numpy scikit-learn scipy scikit-image
@@ -39,8 +39,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # ── Importar config y modelo desde la raíz del proyecto ──────────────────────
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from config import CONFIG
 from models.attention_unet import AttentionUNet, bce_dice_loss, compute_all_metrics

@@ -27,7 +27,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 US_DATA_PATH: str = os.getenv(

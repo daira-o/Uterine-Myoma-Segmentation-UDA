@@ -12,10 +12,12 @@ proyecto/
 ├── models/
 │   └── attention_unet.py       ← arquitectura + métricas
 ├── scripts/
-│   ├── procesador_imagenes.py  ← NIfTI → .npy listos para entrenar
-│   ├── train.py                ← entrenamiento con patient-level split
-│   ├── visualizar_modelo.py    ← dashboard Streamlit
-│   └── visualizadores/         ← utilidades interactivas de auditoría
+│   ├── data_preparation/       ← pipelines MRI/US, curación y splits
+│   ├── training/               ← entrenamientos source, target y baselines
+│   ├── inference/              ← inferencia de producción
+│   ├── evaluation/             ← revisión de dataset y comparación de modelos
+│   ├── visualization/          ← dashboards y visualizadores
+│   └── utils/                  ← utilidades operativas pequeñas
 └── logs/
     └── training_metrics.csv    ← métricas por época (auto-generado)
 ```
@@ -42,16 +44,16 @@ LOGS_PATH=logs
 
 ```bash
 # 1. Procesar NIfTI originales a .npy
-python scripts/procesador_imagenes.py
+python scripts/data_preparation/mri_pipeline.py
 
 # 2. Entrenar
-python scripts/train.py
+python scripts/training/train_source.py
 
 # 3. Visualizar
-streamlit run scripts/visualizar_modelo.py
+streamlit run scripts/visualization/visualizar_modelo.py
 
-# Auditoría rápida MRI mid vs US F28
-python scripts/visualizadores/comparar_mid_random.py
+# Visualizar ultrasonido procesado
+python scripts/visualization/visualizador_us.py
 ```
 
 ## Métricas guardadas
