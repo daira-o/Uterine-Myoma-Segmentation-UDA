@@ -171,13 +171,13 @@ torch.nn.functional.cross_entropy(domain_logits, domain_labels)
 
 No se aplica softmax antes de la loss.
 
-### `scripts/train_target.py`
+### `scripts/training/train_target.py`
 
 Entrena la Fase 2 completa.
 
 Hace:
 
-- Carga MRI train/val igual que `scripts/train_source.py`.
+- Carga MRI train/val igual que `scripts/training/train_source.py`.
 - Carga US desde `data_ready_US/train/images`.
 - Carga pesos preentrenados de Fase 1 dentro de `DANNUNet.segmenter`.
 - Entrena con batches simultaneos MRI + US.
@@ -417,13 +417,13 @@ el discriminator esta distinguiendo dominios con facilidad.
 Desde la raiz del proyecto:
 
 ```powershell
-python scripts/train_target.py
+python scripts/training/train_target.py
 ```
 
 Si se usa el Python local configurado en este entorno:
 
 ```powershell
-& "C:\Users\Daira\AppData\Local\Python\pythoncore-3.12-64\python.exe" scripts\train_target.py
+& "C:\Users\Daira\AppData\Local\Python\pythoncore-3.12-64\python.exe" scripts\training\train_target.py
 ```
 
 ## Fase 3: inferencia de produccion
@@ -448,7 +448,7 @@ US 256x256 a 0.8 mm/px
 El script implementado es:
 
 ```text
-scripts/infer_us_production.py
+scripts/inference/infer_us_production.py
 ```
 
 Este script carga el checkpoint DANN, extrae solo:
@@ -463,19 +463,19 @@ discriminator quedan descartados por completo.
 Ejemplo con una carpeta US:
 
 ```powershell
-python scripts/infer_us_production.py --input data_ready_US/test/images
+python scripts/inference/infer_us_production.py --input data_ready_US/test/images
 ```
 
 Ejemplo con una sola imagen:
 
 ```powershell
-python scripts/infer_us_production.py --input data_ready_US/test/images/imagen.npy
+python scripts/inference/infer_us_production.py --input data_ready_US/test/images/imagen.npy
 ```
 
 Usando checkpoint explicito:
 
 ```powershell
-python scripts/infer_us_production.py ^
+python scripts/inference/infer_us_production.py ^
   --input data_ready_US/test/images ^
   --checkpoint logs/checkpoints_dann/best_model_dann.pth ^
   --threshold 0.5 ^
@@ -510,19 +510,19 @@ Tambien se agrego un dashboard Streamlit para inspeccionar predicciones sobre
 ultrasonido:
 
 ```text
-scripts/visualizar_us_modelo.py
+scripts/visualization/visualizar_us_modelo.py
 ```
 
 Ejecucion:
 
 ```powershell
-streamlit run scripts/visualizar_us_modelo.py
+streamlit run scripts/visualization/visualizar_us_modelo.py
 ```
 
 O con el Python local:
 
 ```powershell
-& "C:\Users\Daira\AppData\Local\Python\pythoncore-3.12-64\python.exe" -m streamlit run scripts\visualizar_us_modelo.py
+& "C:\Users\Daira\AppData\Local\Python\pythoncore-3.12-64\python.exe" -m streamlit run scripts\visualization\visualizar_us_modelo.py
 ```
 
 El visualizador:

@@ -2,10 +2,10 @@
 Build fresh train/val/test splits after visual curation.
 
 Default workflow:
-    python scripts/build_us_splits_from_clean.py
+    python scripts/data_preparation/build_us_splits_from_clean.py
 
 Example:
-    python scripts/build_us_splits_from_clean.py --ratios 0.70 0.15 0.15 --random-state 123
+    python scripts/data_preparation/build_us_splits_from_clean.py --ratios 0.70 0.15 0.15 --random-state 123
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from random import Random
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CLEAN_ROOT = PROJECT_ROOT / "data_ready_US_clean"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data_ready_US_curated"
 DEFAULT_REVIEW_JSON = PROJECT_ROOT / "data_ready_US_review_progress.json"

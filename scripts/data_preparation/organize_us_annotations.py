@@ -5,10 +5,10 @@ Matches are made by exact base filename, ignoring only the file extension.
 The existing image folder structure is preserved.
 
 Default:
-    python scripts/organize_us_annotations.py
+    python scripts/data_preparation/organize_us_annotations.py
 
 Dry run:
-    python scripts/organize_us_annotations.py --dry-run
+    python scripts/data_preparation/organize_us_annotations.py --dry-run
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET_ROOT = PROJECT_ROOT / "data" / "Ultrasound"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 

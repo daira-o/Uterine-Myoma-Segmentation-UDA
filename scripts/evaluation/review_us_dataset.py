@@ -2,11 +2,11 @@
 Interactive visual curation for processed ultrasound .npy files.
 
 Default workflow:
-    python scripts/review_us_dataset.py
+    python scripts/evaluation/review_us_dataset.py
 
 Useful options:
-    python scripts/review_us_dataset.py --review-all
-    python scripts/review_us_dataset.py --source-root data_ready_US --show-hist
+    python scripts/evaluation/review_us_dataset.py --review-all
+    python scripts/evaluation/review_us_dataset.py --source-root data_ready_US --show-hist
 
 Keyboard shortcuts inside the matplotlib window:
     k = keep      d = discard   u = unsure
@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCE_ROOT = PROJECT_ROOT / "data_ready_US"
 DEFAULT_PROGRESS_JSON = PROJECT_ROOT / "data_ready_US_review_progress.json"
 DEFAULT_PROGRESS_CSV = PROJECT_ROOT / "data_ready_US_review_progress.csv"

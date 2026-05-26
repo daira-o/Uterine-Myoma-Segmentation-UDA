@@ -40,8 +40,8 @@ except ImportError:
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import sys
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from config import CONFIG
 from models.attention_unet import AttentionUNet, compute_all_metrics

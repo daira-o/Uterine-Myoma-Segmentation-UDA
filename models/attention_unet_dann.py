@@ -72,4 +72,3 @@ class AttentionUNetDANN(AttentionUNet):
         if return_features:
             return logits, features
         return logits
-

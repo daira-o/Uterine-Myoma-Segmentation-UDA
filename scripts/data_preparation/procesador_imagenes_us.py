@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(ENV_PATH)
 
