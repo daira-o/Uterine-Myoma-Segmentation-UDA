@@ -1,13 +1,12 @@
 """
-scripts/visualization/visualizar_us_modelo.py
-Visualizador Streamlit para inferencia de miomas en ultrasonido.
+scripts/visualization/visualizar_us_modelo_pu.py
+Visualizador Streamlit para el experimento PU-inspired de ultrasonido.
 
-Carga el checkpoint del entrenamiento target con weak supervision por bbox,
-descarta GRL/DomainDiscriminator si existen y usa solo el segmentador adaptado
-para predecir mascaras sobre US 256x256.
+Carga un checkpoint de train_target_pu.py, descarta cualquier cabeza DANN si
+existe y usa solo el segmentador adaptado para predecir mascaras US 256x256.
 
 Uso:
-    streamlit run scripts/visualization/visualizar_us_modelo.py
+    streamlit run scripts/visualization/visualizar_us_modelo_pu.py
 """
 
 from __future__ import annotations
@@ -55,30 +54,28 @@ DEFAULT_US_PATH = (
     or CONFIG.get("us_ready_path")
     or os.path.join(str(ROOT), "data_ready_US")
 )
-
-
 def project_path(path_value: str | os.PathLike[str]) -> Path:
     path = Path(path_value).expanduser()
     return path if path.is_absolute() else ROOT / path
 
 
+DEFAULT_CHECKPOINT = str(
+    project_path(CONFIG.get("logs_path", "logs"))
+    / "checkpoints_target_pu"
+    / "best_model_target_pu.pth"
+)
+
+
 def default_checkpoint_path() -> str:
-    logs_dir = project_path(CONFIG.get("logs_path", "logs"))
+    ckpt_dir = project_path(CONFIG.get("logs_path", "logs")) / "checkpoints_target_pu"
     candidates = [
-        # Checkpoints from logs/target_training_metrics_weak.csv.
-        logs_dir / "legacy_scripts" / "checkpoints_dann" / "best_model_dann.pth",
-        logs_dir / "legacy_scripts" / "checkpoints_dann" / "last_model_dann.pth",
-        # Fallback for workspaces that saved weak checkpoints with explicit names.
-        logs_dir / "checkpoints_weak" / "best_model_weak.pth",
-        logs_dir / "checkpoints_weak" / "last_model_weak.pth",
+        ckpt_dir / "best_model_target_pu.pth",
+        ckpt_dir / "last_model_target_pu.pth",
     ]
     for path in candidates:
         if path.exists():
             return str(path)
     return str(candidates[0])
-
-
-DEFAULT_CHECKPOINT = default_checkpoint_path()
 
 CMAP_US = LinearSegmentedColormap.from_list(
     "us_gray",
@@ -88,7 +85,7 @@ CMAP_US = LinearSegmentedColormap.from_list(
 
 
 st.set_page_config(
-    page_title="Visualizador US Weak",
+    page_title="Visualizador US PU",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -143,6 +140,10 @@ def list_us_images(base_path: str, split: str) -> list[str]:
         patterns = [os.path.join(base_path, split, "images", "*.npy")]
     paths = sorted({p for pattern in patterns for p in glob.glob(pattern)})
     return paths
+
+
+def split_counts(base_path: str) -> dict[str, int]:
+    return {name: len(list_us_images(base_path, name)) for name in ["train", "val", "test", "all"]}
 
 
 def load_us_npy(path: str) -> np.ndarray:
@@ -280,6 +281,33 @@ def draw_bboxes(ax, boxes: list[BBox], color: str = "#00d1b2", linewidth: float 
         )
 
 
+def boxes_to_mask(boxes: list[BBox], shape: tuple[int, int] = (256, 256)) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    height, width = shape
+    for box in boxes:
+        xmin = max(0, min(width, int(np.floor(box.xmin))))
+        xmax = max(0, min(width, int(np.ceil(box.xmax))))
+        ymin = max(0, min(height, int(np.floor(box.ymin))))
+        ymax = max(0, min(height, int(np.ceil(box.ymax))))
+        if xmax > xmin and ymax > ymin:
+            mask[ymin:ymax, xmin:xmax] = True
+    return mask
+
+
+def bbox_overlap_metrics(mask: np.ndarray, boxes: list[BBox]) -> dict[str, float]:
+    bbox_mask = boxes_to_mask(boxes, mask.shape)
+    pred = mask.astype(bool)
+    pred_area = float(pred.sum())
+    bbox_area = float(bbox_mask.sum())
+    intersection = float((pred & bbox_mask).sum())
+    union = float((pred | bbox_mask).sum())
+    return {
+        "bbox_in": intersection / pred_area if pred_area > 0 else 0.0,
+        "bbox_iou": intersection / union if union > 0 else 0.0,
+        "bin_area_ratio": pred_area / max(bbox_area, 1.0),
+    }
+
+
 def make_panel(title: str):
     fig, ax = plt.subplots(figsize=(5, 5), facecolor="#070909")
     ax.set_title(title, color="#708481", fontsize=8, fontfamily="monospace", pad=6)
@@ -289,13 +317,20 @@ def make_panel(title: str):
 
 
 with st.sidebar:
-    st.markdown('<div class="main-title" style="font-size:1.35rem">US Weak</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">Weak supervision bbox</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title" style="font-size:1.35rem">US PU</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Weak bbox PU-inspired</div>', unsafe_allow_html=True)
     st.markdown("---")
 
     base_path = st.text_input("Directorio US procesado", value=DEFAULT_US_PATH)
-    split = st.selectbox("Split", ["test", "val", "train", "all"], index=0)
-    checkpoint_path = st.text_input("Checkpoint weak", value=DEFAULT_CHECKPOINT)
+    counts = split_counts(base_path) if os.path.isdir(base_path) else {}
+    split_options = ["val", "test", "train", "all"]
+    split = st.selectbox(
+        "Split",
+        split_options,
+        index=0,
+        format_func=lambda name: f"{name} ({counts.get(name, 0)} imagenes)",
+    )
+    checkpoint_path = st.text_input("Checkpoint PU", value=default_checkpoint_path())
 
     st.markdown("---")
     threshold_slider = st.slider(
@@ -343,14 +378,25 @@ with st.sidebar:
     st.markdown(f'<div class="info-box">Dispositivo: <b>{device_name}</b></div>', unsafe_allow_html=True)
 
 
-st.markdown('<h1 class="main-title">Visualizador de Ultrasonido</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-title">Visualizador US PU-inspired</h1>', unsafe_allow_html=True)
 st.markdown(
     '<p class="subtitle">Attention U-Net adaptada con weak supervision por bbox</p>',
     unsafe_allow_html=True,
 )
 
 if not os.path.exists(checkpoint_path):
-    st.markdown(f'<div class="warn-box">No se encontro el checkpoint: {checkpoint_path}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="warn-box">
+        No se encontro el checkpoint PU:<br><b>{checkpoint_path}</b><br><br>
+        Primero corre:<br>
+        <code>python scripts\\training\\train_target_pu.py</code><br><br>
+        Cuando termine al menos una epoca, este visualizador va a cargar
+        <code>best_model_target_pu.pth</code> o <code>last_model_target_pu.pth</code>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.stop()
 if not os.path.isdir(base_path):
     st.markdown(f'<div class="warn-box">No se encontro el directorio: {base_path}</div>', unsafe_allow_html=True)
@@ -363,8 +409,9 @@ if not all_images:
 
 model = load_segmenter(checkpoint_path, device_name)
 
+st.caption(f"Split activo: {split} | Imagenes encontradas: {len(all_images):,}")
 st.markdown(
-    f'<div class="info-box">Checkpoint weak cargado como segmentador - {len(all_images):,} imagenes US disponibles</div>',
+    f'<div class="info-box">Checkpoint PU cargado como segmentador · {len(all_images):,} imagenes US disponibles</div>',
     unsafe_allow_html=True,
 )
 
@@ -397,19 +444,24 @@ area_px = int(mask.sum())
 area_mm2 = area_px * (0.8 ** 2)
 max_prob = float(prob_map.max())
 mean_prob_in_mask = float(prob_map[mask.astype(bool)].mean()) if area_px > 0 else 0.0
+top1_prob = float(np.quantile(prob_map, 0.99))
+raw_bbox_metrics = bbox_overlap_metrics(raw_mask, bboxes)
+final_bbox_metrics = bbox_overlap_metrics(mask, bboxes)
 
 st.markdown("---")
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 metric_card(m1, f"{area_px}", "Area px")
 metric_card(m2, f"{area_mm2:.1f}", "Area mm2 aprox")
 metric_card(m3, f"{post.stats['objects_before']} -> {n_objects}", "Objetos")
 metric_card(m4, f"{max_prob:.3f}", "Prob max")
+metric_card(m5, f"{top1_prob:.3f}", "Prob p99")
+metric_card(m6, f"{final_bbox_metrics['bbox_in']:.3f}", "BBox in final")
 
 if max_prob < threshold:
     st.markdown(
         f'<div class="warn-box">Mascara vacia: prob_max={max_prob:.4f} esta por debajo '
         f'del umbral={threshold:.3f}. Para diagnostico, baja el umbral fino o revisa '
-        f'si el checkpoint weak ya entreno suficientes epocas.</div>',
+        f'si el checkpoint PU ya entreno suficientes epocas.</div>',
         unsafe_allow_html=True,
     )
 
@@ -422,7 +474,7 @@ if not bboxes:
 st.markdown("---")
 st.markdown('<div class="section-header">Visualizacion</div>', unsafe_allow_html=True)
 
-cols = st.columns(3)
+cols = st.columns(4)
 
 with cols[0]:
     fig, ax = make_panel("US procesado + bbox")
@@ -433,6 +485,17 @@ with cols[0]:
     plt.close(fig)
 
 with cols[1]:
+    fig, ax = make_panel("Probabilidad sigmoid")
+    ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
+    heat = ax.imshow(prob_map, cmap="magma", vmin=0, vmax=max(0.05, max_prob), alpha=0.72)
+    draw_contours(ax, prob_map, threshold=max(0.01, min(threshold, max_prob)), color="#00ffcc")
+    draw_bboxes(ax, bboxes)
+    draw_bboxes(ax, post.expanded_bboxes, color="#f2a93b", linewidth=1.4)
+    fig.colorbar(heat, ax=ax, fraction=0.046, pad=0.02)
+    st.image(fig_to_bytes(fig), width="stretch")
+    plt.close(fig)
+
+with cols[2]:
     fig, ax = make_panel(f"Antes postprocess - thr={threshold:.2f}")
     ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
     overlay = np.ma.masked_where(raw_mask == 0, raw_mask)
@@ -442,7 +505,7 @@ with cols[1]:
     st.image(fig_to_bytes(fig), width="stretch")
     plt.close(fig)
 
-with cols[2]:
+with cols[3]:
     fig, ax = make_panel("Mascara final postprocess")
     ax.imshow(image_np, cmap=CMAP_US, vmin=0, vmax=1, interpolation="bicubic")
     overlay = np.ma.masked_where(mask == 0, mask)
@@ -455,7 +518,7 @@ with cols[2]:
 
 st.markdown("---")
 with st.expander("Guardar prediccion actual", expanded=False):
-    output_dir = st.text_input("Carpeta de salida", value=os.path.join(str(ROOT), "outputs", "phase3_viewer_exports"))
+    output_dir = st.text_input("Carpeta de salida", value=os.path.join(str(ROOT), "outputs", "pu_viewer_exports"))
     if st.button("Guardar mascara, probabilidad y overlay"):
         out = Path(output_dir)
         (out / "masks").mkdir(parents=True, exist_ok=True)
@@ -492,11 +555,14 @@ with st.expander("Detalles tecnicos", expanded=False):
             "bbox_margin_px": int(bbox_margin_px),
             "closing_kernel_px": int(closing_kernel_px),
             "postprocessing": post.stats,
+            "bbox_metrics_raw": raw_bbox_metrics,
+            "bbox_metrics_final": final_bbox_metrics,
             "area_px": area_px,
             "area_mm2_aprox_0_8mm_px": area_mm2,
             "prob_max": max_prob,
+            "prob_p99": top1_prob,
             "prob_media_en_mascara": mean_prob_in_mask,
             "checkpoint": checkpoint_path,
-            "grl_domain_discriminator": "descartados si estaban presentes",
+            "grl_domain_discriminator": "ignorados si existen; se visualiza solo el segmentador PU",
         }
     )

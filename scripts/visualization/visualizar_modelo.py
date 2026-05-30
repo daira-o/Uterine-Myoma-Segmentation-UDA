@@ -24,8 +24,9 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.path import Path
+from matplotlib.path import Path as MplPath
 from matplotlib.patches import PathPatch
+from pathlib import Path
 import streamlit as st
 import io
 from scipy.ndimage import gaussian_filter
@@ -344,8 +345,8 @@ def draw_contours(ax, prob_map, thr, display_shape,
 
     for i, c in enumerate(contours):
         xy = tile_contour_to_display(c, prob_map.shape, display_shape, transform)
-        codes = [Path.MOVETO] + [Path.LINETO] * (len(xy) - 1) + [Path.CLOSEPOLY]
-        path  = Path(np.vstack([xy, xy[0]]), codes)
+        codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(xy) - 1) + [MplPath.CLOSEPOLY]
+        path  = MplPath(np.vstack([xy, xy[0]]), codes)
 
         ax.add_patch(PathPatch(path,
                                facecolor=fill_color, edgecolor="none",
@@ -374,8 +375,8 @@ def draw_error_contours(ax, prob_map, mask_np, thr, display_shape, transform=Non
         first = True
         for c in measure.find_contours(rs, level=0.5):
             xy = tile_contour_to_display(c, prob_map.shape, display_shape, transform)
-            codes = [Path.MOVETO] + [Path.LINETO] * (len(xy) - 1) + [Path.CLOSEPOLY]
-            path  = Path(np.vstack([xy, xy[0]]), codes)
+            codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(xy) - 1) + [MplPath.CLOSEPOLY]
+            path  = MplPath(np.vstack([xy, xy[0]]), codes)
             ax.add_patch(PathPatch(path, facecolor=fill, edgecolor="none",
                                    alpha=0.35, zorder=3))
             ax.plot(xy[:, 0], xy[:, 1], color=line, linewidth=1.8,

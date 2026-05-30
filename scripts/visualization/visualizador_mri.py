@@ -5,6 +5,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="Visualizador rápido de cortes procesados (NPY)")
     parser.add_argument("--path", type=str, default="data_ready_RM/train", 
@@ -13,13 +16,28 @@ def get_args():
                         help="Número de muestras aleatorias a visualizar")
     return parser.parse_args()
 
+
+def resolve_split_dir(split_path: str) -> Path:
+    split_dir = Path(split_path).expanduser()
+    if split_dir.is_absolute() or split_dir.exists():
+        return split_dir
+
+    project_split_dir = PROJECT_ROOT / split_dir
+    if project_split_dir.exists():
+        return project_split_dir
+
+    return split_dir
+
+
 def visualize_samples(split_path: str, num_samples: int):
-    split_dir = Path(split_path)
+    split_dir = resolve_split_dir(split_path)
     img_dir = split_dir / "images"
     mask_dir = split_dir / "masks"
 
     if not img_dir.exists() or not mask_dir.exists():
         print(f"[ERROR] No se encontraron las carpetas 'images' o 'masks' en: {split_dir.resolve()}")
+        if not Path(split_path).is_absolute():
+            print(f"[INFO] Tambien se intento desde la raiz del proyecto: {(PROJECT_ROOT / split_path).resolve()}")
         return
 
     # Listar y emparejar archivos por ID

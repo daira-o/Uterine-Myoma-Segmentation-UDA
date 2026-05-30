@@ -1,9 +1,12 @@
 """
-scripts/training/train_target.py
-Entrenamiento DANN MRI -> US para la Attention U-Net.
+scripts/training/train_target_pu.py
+Entrenamiento experimental PU-inspired MRI -> US para la Attention U-Net.
 
-Prioriza segmentacion supervisada MRI, supervision debil US y deja DANN como
-regularizador suave:
+Parte de train_target.py, pero cambia la interpretacion weak US:
+fuera de bbox es background confiable; dentro de bbox es region candidata /
+unlabeled, no una mascara positiva completa. Mantiene DANN apagado por defecto.
+
+Prioriza segmentacion supervisada MRI, supervision weak PU-inspired US:
     total = lambda_mri * seg_loss_mri
           + lambda_us * weak_loss_us
           + lambda_domain * domain_loss
@@ -55,6 +58,14 @@ MRI_DOMAIN = 0
 US_DOMAIN = 1
 WEAK_MODES = ("bbox", "pseudomask")
 WEAK_LOSS_TYPES = ("soft_bbox", "legacy_bbox")
+
+# Overrides locales del experimento PU. No tocar train_target.py: esta variante
+# guarda sus artefactos por separado y mantiene DANN desactivado por defecto.
+CONFIG["lambda_domain_base"] = float(os.getenv("LAMBDA_DOMAIN_BASE", "0.0"))
+CONFIG["weak_debug_dir"] = os.getenv(
+    "WEAK_DEBUG_DIR",
+    str(Path(CONFIG["outputs_path"]) / "debug_weak_supervision_pu"),
+)
 
 
 class UltrasoundDataset(Dataset):
@@ -368,11 +379,14 @@ def soft_bbox_loss(
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Supervision debil suave por bbox unica.
+    Supervision debil PU-inspired por bbox unica.
 
-    - bbox original: incentiva presencia positiva, sin exigir llenar la caja.
-    - bbox expandida: zona permitida.
-    - fuera de bbox expandida: penalizacion principal contra activaciones.
+    - Fuera de bbox expandida: background confiable.
+    - Dentro de bbox estricta: region unlabeled/candidata, no mascara positiva
+      completa. Solo se pide presencia top-k para evitar asumir que toda la bbox
+      es mioma.
+    - Area usa la bbox estricta como prior suave de tamano, no como etiqueta
+      pixel-wise positiva.
     """
     probs = torch.sigmoid(pred_logits.float())
     bbox_mask = (bbox_mask.float() > 0.5).float()
@@ -417,13 +431,10 @@ def soft_bbox_loss(
         inside_means.append(mean_inside)
         inside_maxes.append(inside_probs.max())
         inside_topk_means.append(topk_mean)
-        # Linear hinge keeps a useful gradient while probabilities are weak.
-        # The top-k term asks for a small visible activation; the mean term
-        # prevents only one hot pixel from satisfying the bbox supervision.
-        inside_losses.append(
-            F.relu(min_inside_activation - topk_mean)
-            + 0.5 * F.relu(0.5 * min_inside_activation - mean_inside)
-        )
+        # PU-inspired MIL: the bbox is not treated as a dense positive mask.
+        # We only require a small high-probability subset inside the candidate
+        # region, while outside the expanded bbox remains reliable background.
+        inside_losses.append(F.relu(min_inside_activation - topk_mean))
     inside_presence_loss = torch.stack(inside_losses)
     topk_inside_prob = torch.stack(inside_topk_means)
     mean_inside_prob = torch.stack(inside_means)
@@ -816,7 +827,7 @@ _CSV_HEADER = [
 
 def init_target_metrics_csv(run_id: str) -> str:
     os.makedirs(CONFIG["logs_path"], exist_ok=True)
-    csv_path = os.path.join(CONFIG["logs_path"], "target_training_metrics_soft_dann.csv")
+    csv_path = os.path.join(CONFIG["logs_path"], "target_training_metrics_pu.csv")
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             csv.writer(fh).writerow(_CSV_HEADER)
@@ -1035,9 +1046,9 @@ def save_weak_loss_debug(
         inside_max = float(inside_probs.max()) if inside_probs.size else 0.0
         inside_topk = float(prob[topk_mask.astype(bool)].mean()) if topk_mask.any() else 0.0
 
-        # Strict bbox is the base region for inside_presence_loss, area_loss and
-        # bbox metrics. Expanded bbox is only used by outside_loss as a tolerant
-        # no-penalty margin around the coarse annotation.
+        # Strict bbox is the candidate/unlabeled region for PU inside top-k,
+        # area prior and bbox metrics. Expanded bbox is only used by outside_loss
+        # as a tight no-penalty margin around the coarse annotation.
         fig, axes = plt.subplots(2, 4, figsize=(18, 9), facecolor="white", constrained_layout=True)
         axes = axes.ravel()
         panels = [
@@ -1119,15 +1130,29 @@ def compute_target_selection_score(
 ) -> float:
     """US-oriented checkpoint score with a small MRI guard against anatomical drift."""
     if has_us_validation:
-        weak_loss = val_us_metrics["weak_loss_us"]
-        bbox_score = np.mean(
-            [
-                val_us_metrics["bbox_inside_ratio"],
-                val_us_metrics["bbox_iou"],
-                val_us_metrics["bbox_centroid_inside"],
-            ]
+        bbox_inside = float(val_us_metrics.get("bbox_inside_ratio", 0.0))
+        bbox_iou = float(val_us_metrics.get("bbox_iou", 0.0))
+        bbox_centroid = float(val_us_metrics.get("bbox_centroid_inside", 0.0))
+        topk_inside = float(val_us_metrics.get("topk_inside_prob", 0.0))
+        max_inside = float(val_us_metrics.get("max_inside_prob", 0.0))
+        pred_area = float(val_us_metrics.get("predicted_area_ratio", 0.0))
+        weak_loss = float(val_us_metrics.get("weak_loss_us", 0.0))
+        min_area = float(CONFIG.get("weak_min_area_ratio", 0.10))
+        max_area = float(CONFIG.get("weak_max_area_ratio", 0.60))
+        area_penalty = max(0.0, min_area - pred_area) + max(0.0, pred_area - max_area)
+
+        # PU checkpointing must not reward the degenerate "low loss but no US
+        # activation" solution. Prefer visible probability mass inside the
+        # strict bbox and only use weak_loss as a secondary tie-breaker.
+        target_score = float(
+            2.0 * bbox_inside
+            + 1.5 * topk_inside
+            + 0.5 * max_inside
+            + 0.25 * bbox_iou
+            + 0.25 * bbox_centroid
+            - 0.25 * weak_loss
+            - area_penalty
         )
-        target_score = float(bbox_score - weak_loss)
     else:
         # Fallback when no US validation split exists: prefer lower target loss
         # rather than selecting checkpoints purely from MRI validation Dice.
@@ -1377,7 +1402,7 @@ def run_epoch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Entrena target MRI->US con MRI fuerte, US weak y DANN suave."
+        description="Entrena target MRI->US con weak supervision PU-inspired por bbox."
     )
     parser.add_argument(
         "--lambda_mri",
@@ -1488,7 +1513,10 @@ def train(args: argparse.Namespace | None = None) -> None:
     lambda_mri = args.lambda_mri
     lambda_us = args.lambda_us
     lambda_domain_base = args.lambda_domain
-    use_dann = args.use_dann
+    # With lambda_domain_base=0.0 this experiment is weak-supervision-only. Keep
+    # the DANN module available in the model/checkpoints, but avoid logging or
+    # scheduling an adversarial branch that has no effective weight.
+    use_dann = bool(args.use_dann) and lambda_domain_base > 0.0
     weak_mode = args.weak_mode
     CONFIG["dann_warmup_epochs"] = args.dann_warmup_epochs
     CONFIG["lambda_domain_base"] = lambda_domain_base
@@ -1517,7 +1545,7 @@ def train(args: argparse.Namespace | None = None) -> None:
             pass
 
     log.info("=" * 60)
-    log.info("  MiomaVision - Entrenamiento DANN MRI -> US")
+    log.info("  MiomaVision - Entrenamiento PU-inspired MRI -> US")
     log.info("  Run ID:      %s", run_id)
     log.info("  Dispositivo: %s", device)
     log.info("  Epocas:      %d", CONFIG["epochs"])
@@ -1664,10 +1692,10 @@ def train(args: argparse.Namespace | None = None) -> None:
     )
     csv_path = init_target_metrics_csv(run_id)
 
-    ckpt_dir = Path(CONFIG["logs_path"]) / "checkpoints_dann"
+    ckpt_dir = Path(CONFIG["logs_path"]) / "checkpoints_target_pu"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_path = str(ckpt_dir / "best_model_dann.pth")
-    last_path = str(ckpt_dir / "last_model_dann.pth")
+    best_path = str(ckpt_dir / "best_model_target_pu.pth")
+    last_path = str(ckpt_dir / "last_model_target_pu.pth")
 
     best_dice = 0.0
     best_weak_score = -np.inf
@@ -1678,6 +1706,38 @@ def train(args: argparse.Namespace | None = None) -> None:
     total_steps = CONFIG["epochs"] * max(1, steps_per_epoch)
     warmup_steps = min(total_steps, int(CONFIG.get("dann_warmup_epochs", 10)) * max(1, steps_per_epoch))
     global_step = 0
+
+    initial_val_metrics = {"Dice": 0.0, "HD95": np.inf, "Object_Precision": 0.0}
+    initial_us_metrics = {
+        "weak_loss_us": 0.0,
+        "outside_loss": 0.0,
+        "inside_presence_loss": 0.0,
+        "area_loss": 0.0,
+        "bbox_inside_ratio": 0.0,
+        "bbox_iou": 0.0,
+        "bbox_centroid_inside": 0.0,
+        "predicted_area_ratio": 0.0,
+        "mean_inside_prob": 0.0,
+        "max_inside_prob": 0.0,
+        "topk_inside_prob": 0.0,
+    }
+    save_checkpoint(
+        last_path,
+        model,
+        optimizer,
+        epoch=0,
+        best_dice=best_dice,
+        best_target_score=best_target_score,
+        val_metrics=initial_val_metrics,
+        val_us_metrics=initial_us_metrics,
+        alpha=0.0,
+        lambda_mri=lambda_mri,
+        lambda_us=lambda_us,
+        lambda_domain=0.0,
+        use_dann=use_dann,
+        weak_mode=weak_mode,
+    )
+    log.info("Checkpoint inicial PU guardado: %s", last_path)
 
     for epoch in range(1, CONFIG["epochs"] + 1):
         t0 = time.time()
