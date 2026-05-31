@@ -2,8 +2,8 @@
 scripts/inference/infer_us_production.py
 Fase 3: inferencia de produccion sobre ultrasonido estandarizado.
 
-Este script descarta GRL y DomainDiscriminator. Carga solamente el segmentador
-adaptado desde un checkpoint DANN y predice mascaras sobre imagenes US 256x256
+Este script descarta GRL y DomainDiscriminator si existen. Carga solamente el
+segmentador adaptado desde un checkpoint target y predice mascaras sobre imagenes US 256x256
 normalizadas, idealmente a 0.8 mm/px como las generadas por us_pipeline.py.
 
 Uso:
@@ -63,18 +63,31 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-DEFAULT_CHECKPOINT = os.path.join(
-    CONFIG["logs_path"],
-    "checkpoints_dann",
-    "best_model_dann.pth",
-)
 DEFAULT_OUTPUT_DIR = os.path.join("outputs", "phase3_inference")
 SUPPORTED_IMAGE_EXTS = {".npy", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+def latest_target_checkpoint() -> str:
+    checkpoint_root = Path(CONFIG["logs_path"]) / "checkpoints"
+    candidates: list[Path] = []
+    if checkpoint_root.exists():
+        for pattern in ("**/best_model.pth", "**/best_model_dann.pth"):
+            candidates.extend(path for path in checkpoint_root.glob(pattern) if path.is_file())
+        for name in ("best_model.pth", "best_model_dann.pth"):
+            direct = checkpoint_root / name
+            if direct.is_file():
+                candidates.append(direct)
+    if candidates:
+        return str(max(candidates, key=lambda path: path.stat().st_mtime))
+    return str(checkpoint_root / "best_model.pth")
+
+
+DEFAULT_CHECKPOINT = latest_target_checkpoint()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inferencia Fase 3: segmentacion US con segmentador DANN adaptado."
+        description="Inferencia Fase 3: segmentacion US con segmentador target adaptado."
     )
     parser.add_argument(
         "--input",
@@ -86,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         default=DEFAULT_CHECKPOINT,
         type=str,
-        help="Checkpoint DANN. Default: logs/checkpoints_dann/best_model_dann.pth",
+        help="Checkpoint target. Default: ultimo best_model*.pth en logs/checkpoints.",
     )
     parser.add_argument(
         "--output-dir",
@@ -208,7 +221,7 @@ def load_image(path: Path) -> np.ndarray:
 
 def extract_segmenter_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
     """
-    Extrae pesos de segmentacion desde checkpoints DANN o state_dicts puros.
+    Extrae pesos de segmentacion desde checkpoints target/DANN o state_dicts puros.
 
     Se ignoran explicitamente GRL y DomainDiscriminator.
     """

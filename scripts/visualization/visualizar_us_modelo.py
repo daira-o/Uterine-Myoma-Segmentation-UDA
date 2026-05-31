@@ -2,8 +2,8 @@
 scripts/visualization/visualizar_us_modelo.py
 Visualizador Streamlit para Fase 3: inferencia de miomas en ultrasonido.
 
-Carga un checkpoint DANN, descarta GRL/DomainDiscriminator y usa solo el
-segmentador adaptado para predecir mascaras sobre US 256x256.
+Carga un checkpoint target, descarta GRL/DomainDiscriminator si existen y usa
+solo el segmentador adaptado para predecir mascaras sobre US 256x256.
 
 Uso:
     streamlit run scripts/visualization/visualizar_us_modelo.py
@@ -49,17 +49,46 @@ from scripts.inference.postprocessing import (
 )
 
 
-DEFAULT_US_PATH = (
-    os.getenv("US_READY_PATH")
-    or CONFIG.get("us_ready_path")
-    or os.path.join(str(ROOT), "data_ready_US")
-)
-DEFAULT_CHECKPOINT = os.path.join(
-    str(ROOT),
-    CONFIG.get("logs_path", "logs"),
-    "checkpoints_dann",
-    "best_model_dann.pth",
-)
+DEFAULT_US_PATH = CONFIG.get("us_ready_path") or os.path.join(str(ROOT), "data_ready_US")
+
+
+def project_path(path_value: str | os.PathLike[str]) -> Path:
+    path = Path(path_value).expanduser()
+    return path if path.is_absolute() else ROOT / path
+
+
+def checkpoint_search_roots() -> list[Path]:
+    logs_path = project_path(CONFIG.get("logs_path", "logs"))
+    return [
+        logs_path / "checkpoints",
+    ]
+
+
+def best_checkpoints_under(root: Path) -> list[Path]:
+    candidates: dict[str, Path] = {}
+    if not root.exists():
+        return []
+    for pattern in ("**/best_model.pth", "**/best_model_dann.pth"):
+        for path in root.glob(pattern):
+            if path.is_file():
+                candidates[str(path.resolve())] = path
+    for path in (root / "best_model.pth", root / "best_model_dann.pth"):
+        if path.is_file():
+            candidates[str(path.resolve())] = path
+    return list(candidates.values())
+
+
+def latest_best_checkpoint() -> str:
+    # Usa una sola raiz canonica: PROJECT_ROOT/logs.
+    for root in checkpoint_search_roots():
+        candidates = best_checkpoints_under(root)
+        if candidates:
+            return str(max(candidates, key=lambda path: path.stat().st_mtime))
+    else:
+        return str(ROOT / "logs" / "checkpoints" / "best_model.pth")
+
+
+DEFAULT_CHECKPOINT = latest_best_checkpoint()
 
 CMAP_US = LinearSegmentedColormap.from_list(
     "us_gray",
@@ -69,7 +98,7 @@ CMAP_US = LinearSegmentedColormap.from_list(
 
 
 st.set_page_config(
-    page_title="Visualizador US DANN",
+    page_title="Visualizador US Target",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -270,13 +299,14 @@ def make_panel(title: str):
 
 
 with st.sidebar:
-    st.markdown('<div class="main-title" style="font-size:1.35rem">US DANN</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title" style="font-size:1.35rem">US Target</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtitle">Fase 3 · Produccion</div>', unsafe_allow_html=True)
     st.markdown("---")
 
     base_path = st.text_input("Directorio US procesado", value=DEFAULT_US_PATH)
     split = st.selectbox("Split", ["test", "val", "train", "all"], index=0)
-    checkpoint_path = st.text_input("Checkpoint DANN", value=DEFAULT_CHECKPOINT)
+    checkpoint_path = st.text_input("Checkpoint target", value=DEFAULT_CHECKPOINT)
+    st.caption(f"Default autodetectado: {DEFAULT_CHECKPOINT}")
 
     st.markdown("---")
     threshold_slider = st.slider(
@@ -326,7 +356,7 @@ with st.sidebar:
 
 st.markdown('<h1 class="main-title">Visualizador de Ultrasonido</h1>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="subtitle">Attention U-Net adaptada con DANN · Inferencia Fase 3</p>',
+    '<p class="subtitle">Attention U-Net adaptada a US - Inferencia Fase 3</p>',
     unsafe_allow_html=True,
 )
 
@@ -345,7 +375,7 @@ if not all_images:
 model = load_segmenter(checkpoint_path, device_name)
 
 st.markdown(
-    f'<div class="info-box">Checkpoint cargado sin GRL ni discriminator · {len(all_images):,} imagenes US disponibles</div>',
+    f'<div class="info-box">Checkpoint cargado usando solo el segmentador - {len(all_images):,} imagenes US disponibles</div>',
     unsafe_allow_html=True,
 )
 
@@ -390,7 +420,7 @@ if max_prob < threshold:
     st.markdown(
         f'<div class="warn-box">Mascara vacia: prob_max={max_prob:.4f} esta por debajo '
         f'del umbral={threshold:.3f}. Para diagnostico, baja el umbral fino o revisa '
-        f'si el checkpoint DANN ya entreno suficientes epocas.</div>',
+        f'si el checkpoint target ya entreno suficientes epocas.</div>',
         unsafe_allow_html=True,
     )
 
@@ -429,8 +459,6 @@ with cols[2]:
     overlay = np.ma.masked_where(mask == 0, mask)
     ax.imshow(overlay, cmap="autumn", alpha=opacity, interpolation="nearest")
     draw_mask_contours(ax, mask)
-    draw_bboxes(ax, bboxes)
-    draw_bboxes(ax, post.expanded_bboxes, color="#f2a93b", linewidth=1.4)
     st.image(fig_to_bytes(fig), width="stretch")
     plt.close(fig)
 

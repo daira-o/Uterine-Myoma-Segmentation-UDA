@@ -1,9 +1,9 @@
 """
 scripts/training/train_target.py
-Entrenamiento DANN MRI -> US para la Attention U-Net.
+Entrenamiento target MRI -> US para la Attention U-Net.
 
-Prioriza segmentacion supervisada MRI, supervision debil US y deja DANN como
-regularizador suave:
+Prioriza segmentacion supervisada MRI y supervision debil US. DANN queda
+disponible como regularizador opcional, apagado por defecto:
     total = lambda_mri * seg_loss_mri
           + lambda_us * weak_loss_us
           + lambda_domain * domain_loss
@@ -22,6 +22,7 @@ import sys
 import time
 from itertools import cycle
 from pathlib import Path
+import re
 
 import numpy as np
 import torch
@@ -205,11 +206,7 @@ def get_us_base_path() -> str:
     Prioriza el dataset curado porque la limpieza visual debe ocurrir antes
     del split final. Se puede sobreescribir con US_READY_PATH sin tocar config.py.
     """
-    return (
-        os.getenv("US_READY_PATH")
-        or CONFIG.get("us_ready_path")
-        or os.path.join(str(ROOT), "data_ready_US")
-    )
+    return CONFIG.get("us_ready_path") or os.path.join(str(ROOT), "data_ready_US")
 
 
 def set_decoder_trainable(model: DANNUNet, trainable: bool) -> None:
@@ -334,8 +331,13 @@ def soft_bbox_loss(
     inside_weight: float = 0.5,
     area_weight: float = 0.05,
     min_inside_activation: float = 0.20,
+    min_area_ratio: float = 0.15,
     max_area_ratio: float = 1.5,
+    under_area_weight: float = 2.0,
+    over_area_weight: float = 1.0,
     inside_topk_fraction: float = 0.10,
+    min_inside_mean: float = 0.08,
+    inside_mean_weight: float = 0.5,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
@@ -350,9 +352,9 @@ def soft_bbox_loss(
     expanded_bbox = expand_bbox_mask(bbox_mask, bbox_margin_px)
     outside_mask = 1.0 - expanded_bbox
 
-    outside_targets = torch.zeros_like(probs)
-    outside_loss_map = F.binary_cross_entropy(
-        probs.clamp(min=eps, max=1.0 - eps),
+    outside_targets = torch.zeros_like(pred_logits.float())
+    outside_loss_map = F.binary_cross_entropy_with_logits(
+        pred_logits.float(),
         outside_targets,
         reduction="none",
     )
@@ -360,24 +362,39 @@ def soft_bbox_loss(
     outside_loss = (outside_loss_map * outside_mask).sum(dim=(1, 2, 3)) / outside_area
 
     inside_losses = []
-    inside_means = []
+    inside_mean_losses = []
+    mean_inside_probs = []
+    topk_inside_probs = []
     for sample_probs, sample_bbox in zip(probs, bbox_mask):
         inside_probs = sample_probs[sample_bbox.bool()]
         if inside_probs.numel() == 0:
             inside_losses.append(sample_probs.new_tensor(0.0))
-            inside_means.append(sample_probs.new_tensor(0.0))
+            inside_mean_losses.append(sample_probs.new_tensor(0.0))
+            mean_inside_probs.append(sample_probs.new_tensor(0.0))
+            topk_inside_probs.append(sample_probs.new_tensor(0.0))
             continue
         k = max(1, int(round(float(inside_probs.numel()) * inside_topk_fraction)))
         topk_mean = inside_probs.topk(k).values.mean()
-        inside_means.append(topk_mean)
+        mean_inside = inside_probs.mean()
+        topk_inside_probs.append(topk_mean)
+        mean_inside_probs.append(mean_inside)
         inside_losses.append(F.relu(min_inside_activation - topk_mean).pow(2))
-    inside_presence_loss = torch.stack(inside_losses)
-    inside_activation = torch.stack(inside_means)
+        inside_mean_losses.append(F.relu(min_inside_mean - mean_inside))
+    topk_presence_loss = torch.stack(inside_losses)
+    inside_mean_loss = torch.stack(inside_mean_losses)
+    inside_presence_loss = topk_presence_loss + inside_mean_weight * inside_mean_loss
+    mean_prob_inside_bbox = torch.stack(mean_inside_probs)
+    topk_inside_prob = torch.stack(topk_inside_probs)
 
+    # Una mascara vacia tiene area 0. Si solo penalizamos exceso de area,
+    # la solucion vacia puede volverse optima cuando outside_loss domina.
+    # Esta banda penaliza mascaras demasiado chicas y demasiado grandes.
     pred_area = probs.sum(dim=(1, 2, 3))
     bbox_area = bbox_mask.sum(dim=(1, 2, 3)).clamp_min(1.0)
     predicted_area_ratio = pred_area / bbox_area
-    area_loss = F.relu(predicted_area_ratio - max_area_ratio).pow(2)
+    under_area = F.relu(min_area_ratio - predicted_area_ratio)
+    over_area = F.relu(predicted_area_ratio - max_area_ratio)
+    area_loss = under_area_weight * under_area + over_area_weight * over_area
 
     total = (
         outside_weight * outside_loss
@@ -387,10 +404,15 @@ def soft_bbox_loss(
     components = {
         "outside_loss": outside_loss.mean(),
         "inside_presence_loss": inside_presence_loss.mean(),
+        "inside_mean_loss": inside_mean_loss.mean(),
+        "mean_prob_inside_bbox": mean_prob_inside_bbox.mean(),
+        "topk_inside_prob": topk_inside_prob.mean(),
         "area_loss": area_loss.mean(),
+        "under_area_loss": under_area.mean(),
+        "over_area_loss": over_area.mean(),
         "weak_us_total": total.mean(),
         "predicted_area_ratio": predicted_area_ratio.mean(),
-        "inside_activation": inside_activation.mean(),
+        "inside_activation": topk_inside_prob.mean(),
         "expanded_bbox_mask": expanded_bbox.detach(),
         "outside_penalty_map": (outside_loss_map * outside_mask).detach(),
     }
@@ -414,8 +436,13 @@ def compute_us_weak_loss(
                 inside_weight=float(CONFIG.get("weak_inside_weight", 0.5)),
                 area_weight=float(CONFIG.get("weak_area_weight", 0.05)),
                 min_inside_activation=float(CONFIG.get("weak_min_inside_activation", 0.20)),
+                min_area_ratio=float(CONFIG.get("weak_min_area_ratio", 0.15)),
                 max_area_ratio=float(CONFIG.get("weak_max_area_ratio", 1.5)),
+                under_area_weight=float(CONFIG.get("weak_under_area_weight", 2.0)),
+                over_area_weight=float(CONFIG.get("weak_over_area_weight", 1.0)),
                 inside_topk_fraction=float(CONFIG.get("weak_inside_fraction", 0.10)),
+                min_inside_mean=float(CONFIG.get("weak_min_inside_mean", 0.08)),
+                inside_mean_weight=float(CONFIG.get("weak_inside_mean_weight", 0.5)),
             )
         if weak_loss_type == "legacy_bbox":
             loss = weak_bbox_loss(
@@ -429,7 +456,12 @@ def compute_us_weak_loss(
             return loss, {
                 "outside_loss": zero,
                 "inside_presence_loss": zero,
+                "inside_mean_loss": zero,
+                "mean_prob_inside_bbox": zero,
+                "topk_inside_prob": zero,
                 "area_loss": zero,
+                "under_area_loss": zero,
+                "over_area_loss": zero,
                 "weak_us_total": loss.detach(),
                 "predicted_area_ratio": zero,
             }
@@ -440,7 +472,12 @@ def compute_us_weak_loss(
         return loss, {
             "outside_loss": zero,
             "inside_presence_loss": zero,
+            "inside_mean_loss": zero,
+            "mean_prob_inside_bbox": zero,
+            "topk_inside_prob": zero,
             "area_loss": zero,
+            "under_area_loss": zero,
+            "over_area_loss": zero,
             "weak_us_total": loss.detach(),
             "predicted_area_ratio": zero,
         }
@@ -548,11 +585,18 @@ def validate_us_weak(
             "weak_loss_us": 0.0,
             "outside_loss": 0.0,
             "inside_presence_loss": 0.0,
+            "inside_mean_loss": 0.0,
+            "mean_prob_inside_bbox": 0.0,
+            "topk_inside_prob": 0.0,
             "area_loss": 0.0,
+            "under_area_loss": 0.0,
+            "over_area_loss": 0.0,
             "bbox_inside_ratio": 0.0,
             "bbox_iou": 0.0,
             "bbox_centroid_inside": 0.0,
             "predicted_area_ratio": 0.0,
+            "min_area_ratio": float(CONFIG.get("weak_min_area_ratio", 0.15)),
+            "max_area_ratio": float(CONFIG.get("weak_max_area_ratio", 1.0)),
         }
 
     model.eval()
@@ -560,7 +604,12 @@ def validate_us_weak(
     metrics = {
         "outside_loss": [],
         "inside_presence_loss": [],
+        "inside_mean_loss": [],
+        "mean_prob_inside_bbox": [],
+        "topk_inside_prob": [],
         "area_loss": [],
+        "under_area_loss": [],
+        "over_area_loss": [],
         "bbox_inside_ratio": [],
         "bbox_iou": [],
         "bbox_centroid_inside": [],
@@ -575,7 +624,16 @@ def validate_us_weak(
             assert seg_logits is not None
             weak_loss, weak_parts = compute_us_weak_loss(seg_logits, weak_masks, weak_mode)
             losses.append(float(weak_loss.item()))
-            for key in ("outside_loss", "inside_presence_loss", "area_loss"):
+            for key in (
+                "outside_loss",
+                "inside_presence_loss",
+                "inside_mean_loss",
+                "mean_prob_inside_bbox",
+                "topk_inside_prob",
+                "area_loss",
+                "under_area_loss",
+                "over_area_loss",
+            ):
                 metrics[key].append(float(weak_parts[key].item()))
             batch_metrics = compute_us_bbox_metrics(
                 seg_logits,
@@ -591,7 +649,22 @@ def validate_us_weak(
         "inside_presence_loss": float(np.mean(metrics["inside_presence_loss"]))
         if metrics["inside_presence_loss"]
         else 0.0,
+        "inside_mean_loss": float(np.mean(metrics["inside_mean_loss"]))
+        if metrics["inside_mean_loss"]
+        else 0.0,
+        "mean_prob_inside_bbox": float(np.mean(metrics["mean_prob_inside_bbox"]))
+        if metrics["mean_prob_inside_bbox"]
+        else 0.0,
+        "topk_inside_prob": float(np.mean(metrics["topk_inside_prob"]))
+        if metrics["topk_inside_prob"]
+        else 0.0,
         "area_loss": float(np.mean(metrics["area_loss"])) if metrics["area_loss"] else 0.0,
+        "under_area_loss": float(np.mean(metrics["under_area_loss"]))
+        if metrics["under_area_loss"]
+        else 0.0,
+        "over_area_loss": float(np.mean(metrics["over_area_loss"]))
+        if metrics["over_area_loss"]
+        else 0.0,
         "bbox_inside_ratio": float(np.mean(metrics["bbox_inside_ratio"]))
         if metrics["bbox_inside_ratio"]
         else 0.0,
@@ -602,6 +675,8 @@ def validate_us_weak(
         "predicted_area_ratio": float(np.mean(metrics["predicted_area_ratio"]))
         if metrics["predicted_area_ratio"]
         else 0.0,
+        "min_area_ratio": float(CONFIG.get("weak_min_area_ratio", 0.15)),
+        "max_area_ratio": float(CONFIG.get("weak_max_area_ratio", 1.0)),
     }
 
 
@@ -615,13 +690,20 @@ _CSV_HEADER = [
     "weak_us",
     "outside_loss",
     "inside_presence_loss",
+    "inside_mean_loss",
+    "mean_prob_inside_bbox",
+    "topk_inside_prob",
     "area_loss",
+    "under_area_loss",
+    "over_area_loss",
     "total_loss",
     "dom_acc",
     "bbox_in",
     "bbox_iou",
     "bbox_centroid_inside",
     "predicted_area_ratio",
+    "min_area_ratio",
+    "max_area_ratio",
     "val_loss",
     "val_dice",
     "val_hd95",
@@ -629,11 +711,20 @@ _CSV_HEADER = [
     "val_weak_us",
     "val_outside_loss",
     "val_inside_presence_loss",
+    "val_inside_mean_loss",
+    "val_mean_prob_inside_bbox",
+    "val_topk_inside_prob",
     "val_area_loss",
+    "val_under_area_loss",
+    "val_over_area_loss",
     "val_bbox_in",
     "val_bbox_iou",
     "val_bbox_centroid_inside",
     "val_predicted_area_ratio",
+    "val_min_area_ratio",
+    "val_max_area_ratio",
+    "val_area_score",
+    "target_score",
     "alpha",
     "lambda_mri",
     "lambda_us",
@@ -646,6 +737,16 @@ _CSV_HEADER = [
     "is_best",
     "timestamp",
 ]
+
+
+TARGET_SCORE_WEIGHTS = {
+    "val_bbox_inside_ratio": 0.45,
+    "val_bbox_centroid_inside": 0.25,
+    "val_area_score": 0.20,
+    "val_dice": 0.10,
+    "area_min": 0.10,
+    "area_max": 0.40,
+}
 
 
 def init_target_metrics_csv(run_id: str) -> str:
@@ -672,8 +773,45 @@ def init_target_metrics_csv(run_id: str) -> str:
     return csv_path
 
 
+def init_run_metrics_csv(run_dir: Path) -> str:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = run_dir / "metrics.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow(_CSV_HEADER)
+    log.info("Metricas de corrida -> %s", csv_path)
+    return str(csv_path)
+
+
+def append_csv_row(csv_path: str, row: list[object]) -> None:
+    with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow(row)
+
+
+def compute_val_area_score(area_ratio: float, area_min: float = 0.10, area_max: float = 0.40) -> float:
+    if area_min <= area_ratio <= area_max:
+        return 1.0
+    if area_ratio < area_min:
+        return max(0.0, area_ratio / max(area_min, 1e-6))
+    return max(0.0, 1.0 - (area_ratio - area_max) / max(area_max, 1e-6))
+
+
+def compute_target_score(val_us_metrics: dict[str, float], dice_val: float) -> tuple[float, float]:
+    area_score = compute_val_area_score(
+        val_us_metrics["predicted_area_ratio"],
+        area_min=TARGET_SCORE_WEIGHTS["area_min"],
+        area_max=TARGET_SCORE_WEIGHTS["area_max"],
+    )
+    score = (
+        TARGET_SCORE_WEIGHTS["val_bbox_inside_ratio"] * val_us_metrics["bbox_inside_ratio"]
+        + TARGET_SCORE_WEIGHTS["val_bbox_centroid_inside"] * val_us_metrics["bbox_centroid_inside"]
+        + TARGET_SCORE_WEIGHTS["val_area_score"] * area_score
+        + TARGET_SCORE_WEIGHTS["val_dice"] * dice_val
+    )
+    return float(score), float(area_score)
+
+
 def append_target_metrics(
-    csv_path: str,
+    csv_paths: list[str],
     run_id: str,
     epoch: int,
     train_stats: dict[str, float],
@@ -687,53 +825,70 @@ def append_target_metrics(
     use_dann: bool,
     weak_mode: str,
     optimizer: torch.optim.Optimizer,
+    target_score: float,
+    val_area_score: float,
     is_best: bool,
 ) -> None:
     hd95_val = val_metrics["HD95"]
-    with open(csv_path, "a", newline="", encoding="utf-8") as fh:
-        csv.writer(fh).writerow(
-            [
-                run_id,
-                epoch,
-                f"{train_stats['seg_loss_mri']:.6f}",
-                f"{train_stats['domain_loss_mri']:.6f}",
-                f"{train_stats['domain_loss_us']:.6f}",
-                f"{train_stats['domain_loss']:.6f}",
-                f"{train_stats['weak_loss_us']:.6f}",
-                f"{train_stats['outside_loss']:.6f}",
-                f"{train_stats['inside_presence_loss']:.6f}",
-                f"{train_stats['area_loss']:.6f}",
-                f"{train_stats['total_loss']:.6f}",
-                f"{train_stats['domain_acc']:.6f}",
-                f"{train_stats['bbox_inside_ratio']:.6f}",
-                f"{train_stats['bbox_iou']:.6f}",
-                f"{train_stats['bbox_centroid_inside']:.6f}",
-                f"{train_stats['predicted_area_ratio']:.6f}",
-                f"{val_loss:.6f}",
-                f"{val_metrics['Dice']:.6f}",
-                f"{hd95_val:.4f}" if np.isfinite(hd95_val) else "inf",
-                f"{val_metrics['Object_Precision']:.6f}",
-                f"{val_us_metrics['weak_loss_us']:.6f}",
-                f"{val_us_metrics['outside_loss']:.6f}",
-                f"{val_us_metrics['inside_presence_loss']:.6f}",
-                f"{val_us_metrics['area_loss']:.6f}",
-                f"{val_us_metrics['bbox_inside_ratio']:.6f}",
-                f"{val_us_metrics['bbox_iou']:.6f}",
-                f"{val_us_metrics['bbox_centroid_inside']:.6f}",
-                f"{val_us_metrics['predicted_area_ratio']:.6f}",
-                f"{alpha:.6f}",
-                f"{lambda_mri:.6f}",
-                f"{lambda_us:.6f}",
-                f"{lambda_domain:.6f}",
-                int(use_dann),
-                weak_mode,
-                f"{optimizer.param_groups[0]['lr']:.2e}",
-                f"{optimizer.param_groups[1]['lr']:.2e}",
-                f"{optimizer.param_groups[2]['lr']:.2e}",
-                int(is_best),
-                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            ]
-        )
+    row = [
+        run_id,
+        epoch,
+        f"{train_stats['seg_loss_mri']:.6f}",
+        f"{train_stats['domain_loss_mri']:.6f}",
+        f"{train_stats['domain_loss_us']:.6f}",
+        f"{train_stats['domain_loss']:.6f}",
+        f"{train_stats['weak_loss_us']:.6f}",
+        f"{train_stats['outside_loss']:.6f}",
+        f"{train_stats['inside_presence_loss']:.6f}",
+        f"{train_stats['inside_mean_loss']:.6f}",
+        f"{train_stats['mean_prob_inside_bbox']:.6f}",
+        f"{train_stats['topk_inside_prob']:.6f}",
+        f"{train_stats['area_loss']:.6f}",
+        f"{train_stats['under_area_loss']:.6f}",
+        f"{train_stats['over_area_loss']:.6f}",
+        f"{train_stats['total_loss']:.6f}",
+        f"{train_stats['domain_acc']:.6f}",
+        f"{train_stats['bbox_inside_ratio']:.6f}",
+        f"{train_stats['bbox_iou']:.6f}",
+        f"{train_stats['bbox_centroid_inside']:.6f}",
+        f"{train_stats['predicted_area_ratio']:.6f}",
+        f"{CONFIG.get('weak_min_area_ratio', 0.15):.6f}",
+        f"{CONFIG.get('weak_max_area_ratio', 1.0):.6f}",
+        f"{val_loss:.6f}",
+        f"{val_metrics['Dice']:.6f}",
+        f"{hd95_val:.4f}" if np.isfinite(hd95_val) else "inf",
+        f"{val_metrics['Object_Precision']:.6f}",
+        f"{val_us_metrics['weak_loss_us']:.6f}",
+        f"{val_us_metrics['outside_loss']:.6f}",
+        f"{val_us_metrics['inside_presence_loss']:.6f}",
+        f"{val_us_metrics['inside_mean_loss']:.6f}",
+        f"{val_us_metrics['mean_prob_inside_bbox']:.6f}",
+        f"{val_us_metrics['topk_inside_prob']:.6f}",
+        f"{val_us_metrics['area_loss']:.6f}",
+        f"{val_us_metrics['under_area_loss']:.6f}",
+        f"{val_us_metrics['over_area_loss']:.6f}",
+        f"{val_us_metrics['bbox_inside_ratio']:.6f}",
+        f"{val_us_metrics['bbox_iou']:.6f}",
+        f"{val_us_metrics['bbox_centroid_inside']:.6f}",
+        f"{val_us_metrics['predicted_area_ratio']:.6f}",
+        f"{val_us_metrics['min_area_ratio']:.6f}",
+        f"{val_us_metrics['max_area_ratio']:.6f}",
+        f"{val_area_score:.6f}",
+        f"{target_score:.6f}",
+        f"{alpha:.6f}",
+        f"{lambda_mri:.6f}",
+        f"{lambda_us:.6f}",
+        f"{lambda_domain:.6f}",
+        int(use_dann),
+        weak_mode,
+        f"{optimizer.param_groups[0]['lr']:.2e}",
+        f"{optimizer.param_groups[1]['lr']:.2e}",
+        f"{optimizer.param_groups[2]['lr']:.2e}",
+        int(is_best),
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ]
+    for csv_path in csv_paths:
+        append_csv_row(csv_path, row)
 
 
 def load_phase1_checkpoint(model: DANNUNet, device: torch.device) -> None:
@@ -804,48 +959,144 @@ def save_weak_loss_debug(
     step: int,
     output_dir: str,
     threshold: float,
+    max_samples: int = 1,
+    metric_thresholds: list[float] | None = None,
 ) -> None:
     if not output_dir:
         return
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    image = us_images[0, 0].detach().float().cpu().numpy()
-    prob = torch.sigmoid(seg_logits_us[0, 0].detach().float()).cpu().numpy()
-    binary = (prob >= threshold).astype(np.float32)
-    bbox = bbox_masks[0, 0].detach().float().cpu().numpy()
-    expanded = weak_parts.get("expanded_bbox_mask")
-    outside_penalty = weak_parts.get("outside_penalty_map")
-    expanded_np = (
-        expanded[0, 0].detach().float().cpu().numpy()
-        if expanded is not None
-        else bbox
-    )
-    outside_np = (
-        outside_penalty[0, 0].detach().float().cpu().numpy()
-        if outside_penalty is not None
-        else np.zeros_like(prob)
-    )
+    max_samples = max(1, min(int(max_samples), int(us_images.size(0))))
+    metric_thresholds = metric_thresholds or [0.30, 0.35, 0.40, 0.50]
 
-    fig, axes = plt.subplots(1, 5, figsize=(18, 4), facecolor="white", constrained_layout=True)
-    panels = [
-        ("US + bbox", image, "gray"),
-        ("BBox expandida", image, "gray"),
-        ("Prediccion cruda", prob, "magma"),
-        ("Mascara binaria", binary, "gray"),
-        ("Outside penalty", outside_np, "inferno"),
-    ]
-    for ax, (title, base, cmap) in zip(axes, panels):
-        ax.imshow(base, cmap=cmap, vmin=0 if title != "Outside penalty" else None, vmax=1 if title != "Outside penalty" else None)
-        if title == "US + bbox":
-            ax.contour(bbox, levels=[0.5], colors=["#00d1b2"], linewidths=1.6)
-        elif title == "BBox expandida":
-            ax.contour(bbox, levels=[0.5], colors=["#00d1b2"], linewidths=1.4)
-            ax.contour(expanded_np, levels=[0.5], colors=["#ffb000"], linewidths=1.4)
-        ax.set_title(title, fontsize=9)
-        ax.axis("off")
-    fig.savefig(out / f"weak_loss_ep{epoch:03d}_step{step:04d}.png", dpi=170, bbox_inches="tight")
-    plt.close(fig)
+    expanded = weak_parts.get("expanded_bbox_mask")
+    if expanded is None:
+        expanded = expand_bbox_mask(
+            bbox_masks.detach(),
+            int(CONFIG.get("weak_bbox_margin_px", 8)),
+        )
+
+    probs = torch.sigmoid(seg_logits_us.detach().float()).cpu().numpy()
+    images_np = us_images.detach().float().cpu().numpy()
+    bboxes_np = (bbox_masks.detach().float().cpu().numpy() > 0.5)
+    expanded_np_all = (expanded.detach().float().cpu().numpy() > 0.5)
+
+    def contour_if_present(ax, mask: np.ndarray, color: str, linewidth: float) -> None:
+        if np.any(mask) and np.any(~mask):
+            ax.contour(mask.astype(np.float32), levels=[0.5], colors=[color], linewidths=linewidth)
+
+    def threshold_metrics(prob: np.ndarray, bbox: np.ndarray, thr: float, eps: float = 1e-6) -> dict[str, float]:
+        pred = prob >= thr
+        pred_area = float(pred.sum())
+        bbox_area = float(bbox.sum())
+        intersection = float((pred & bbox).sum())
+        union = float((pred | bbox).sum())
+        return {
+            "bin_area_ratio": pred_area / max(bbox_area, eps),
+            "bbox_in": intersection / max(pred_area, eps) if pred_area > 0 else 0.0,
+            "bbox_iou": intersection / max(union, eps) if union > 0 else 0.0,
+        }
+
+    for sample_idx in range(max_samples):
+        image = images_np[sample_idx, 0]
+        prob = probs[sample_idx, 0]
+        binary = prob >= threshold
+        bbox = bboxes_np[sample_idx, 0]
+        expanded_np = expanded_np_all[sample_idx, 0]
+        expanded_only = expanded_np & ~bbox
+        outside = ~expanded_np
+
+        bbox_area = float(bbox.sum())
+        expanded_area = float(expanded_np.sum())
+        prob_area_ratio = float(prob.sum() / max(bbox_area, 1.0))
+        bin_area_ratio = float(binary.sum() / max(bbox_area, 1.0))
+        bbox_in = float((binary & bbox).sum() / max(float(binary.sum()), 1.0))
+
+        inside_probs = prob[bbox]
+        if inside_probs.size:
+            topk_fraction = float(CONFIG.get("weak_inside_fraction", 0.10))
+            k = max(1, int(round(float(inside_probs.size) * topk_fraction)))
+            cutoff = np.partition(inside_probs, -k)[-k]
+            topk_mask = bbox & (prob >= cutoff)
+            inside_mean = float(inside_probs.mean())
+            inside_max = float(inside_probs.max())
+            inside_topk = float(inside_probs[inside_probs >= cutoff].mean())
+        else:
+            topk_mask = np.zeros_like(bbox, dtype=bool)
+            inside_mean = inside_max = inside_topk = 0.0
+
+        region_rgb = np.zeros((*prob.shape, 3), dtype=np.float32)
+        region_rgb[outside] = (0.10, 0.20, 0.55)
+        region_rgb[expanded_only] = (1.00, 0.82, 0.05)
+        region_rgb[bbox] = (0.00, 0.80, 0.35)
+
+        thresh_lines = []
+        for thr in metric_thresholds:
+            metrics = threshold_metrics(prob, bbox, float(thr))
+            thresh_lines.append(
+                f"thr {thr:.2f}: area {metrics['bin_area_ratio']:.2f} | "
+                f"in {metrics['bbox_in']:.2f} | iou {metrics['bbox_iou']:.2f}"
+            )
+
+        summary = (
+            f"epoch {epoch} | step {step} | sample {sample_idx} | threshold {threshold:.2f}\n"
+            f"prob_area_ratio {prob_area_ratio:.3f} | bin_area_ratio {bin_area_ratio:.3f} | "
+            f"bbox_in {bbox_in:.3f}\n"
+            f"inside mean/max/topk {inside_mean:.3f}/{inside_max:.3f}/{inside_topk:.3f} | "
+            f"strict_area {bbox_area:.0f} | expanded_area {expanded_area:.0f}\n"
+            + "\n".join(thresh_lines)
+        )
+
+        fig, axes = plt.subplots(2, 4, figsize=(18, 10), facecolor="white", constrained_layout=True)
+        axes = axes.ravel()
+
+        axes[0].imshow(image, cmap="gray", vmin=0, vmax=1)
+        contour_if_present(axes[0], bbox, "#00c853", 1.8)
+        axes[0].set_title("US + bbox estricta", fontsize=10)
+
+        axes[1].imshow(image, cmap="gray", vmin=0, vmax=1)
+        contour_if_present(axes[1], expanded_np, "#ffd600", 1.8)
+        contour_if_present(axes[1], bbox, "#00c853", 1.3)
+        axes[1].set_title("US + bbox expandida", fontsize=10)
+
+        axes[2].imshow(bbox.astype(np.float32), cmap="Greens", vmin=0, vmax=1)
+        axes[2].set_title("Mascara bbox estricta", fontsize=10)
+
+        im = axes[3].imshow(prob, cmap="magma", vmin=0, vmax=1)
+        axes[3].set_title("Mapa sigmoid probability", fontsize=10)
+        fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+
+        axes[4].imshow(binary.astype(np.float32), cmap="gray", vmin=0, vmax=1)
+        contour_if_present(axes[4], binary, "#ff1744", 1.5)
+        axes[4].set_title("Prediccion binaria", fontsize=10)
+
+        axes[5].imshow(region_rgb)
+        axes[5].set_title("Regiones inside/outside", fontsize=10)
+
+        axes[6].imshow(image, cmap="gray", vmin=0, vmax=1)
+        axes[6].imshow(topk_mask.astype(np.float32), cmap="Reds", alpha=0.55, vmin=0, vmax=1)
+        contour_if_present(axes[6], bbox, "#00c853", 1.3)
+        axes[6].set_title("Top-k dentro de bbox", fontsize=10)
+
+        axes[7].imshow(image, cmap="gray", vmin=0, vmax=1)
+        axes[7].imshow(prob, cmap="magma", alpha=0.35, vmin=0, vmax=1)
+        axes[7].imshow(np.ma.masked_where(~binary, binary), cmap="Reds", alpha=0.35, vmin=0, vmax=1)
+        contour_if_present(axes[7], bbox, "#00c853", 1.6)
+        contour_if_present(axes[7], expanded_np, "#ffd600", 1.3)
+        contour_if_present(axes[7], binary, "#ff1744", 1.2)
+        axes[7].set_title("Overlay final completo", fontsize=10)
+
+        for ax in axes:
+            ax.axis("off")
+
+        fig.suptitle(summary, fontsize=10, y=1.03)
+        fig.savefig(
+            out / f"weak_debug_ep{epoch:03d}_step{step:04d}_sample{sample_idx:02d}.png",
+            dpi=170,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
 
 
 def run_epoch(
@@ -863,10 +1114,16 @@ def run_epoch(
     use_dann: bool,
     weak_mode: str,
     use_amp: bool,
+    steps_per_epoch: int,
     log_every: int = 10,
 ) -> tuple[dict[str, float], float]:
     model.train()
+    # En target adaptation el dominio limitante es US: las imagenes target son
+    # pocas y tienen supervision weak. La epoca debe quedar definida por US
+    # para evitar reciclarlo muchas veces contra todos los batches MRI.
+    mri_iter = cycle(mri_loader)
     us_iter = cycle(us_loader)
+    steps_per_epoch = max(1, int(steps_per_epoch))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     weak_metric_every = max(1, int(CONFIG.get("weak_metric_every", log_every)))
 
@@ -878,7 +1135,12 @@ def run_epoch(
         "weak_loss_us": 0.0,
         "outside_loss": 0.0,
         "inside_presence_loss": 0.0,
+        "inside_mean_loss": 0.0,
+        "mean_prob_inside_bbox": 0.0,
+        "topk_inside_prob": 0.0,
         "area_loss": 0.0,
+        "under_area_loss": 0.0,
+        "over_area_loss": 0.0,
         "total_loss": 0.0,
         "domain_acc": 0.0,
         "bbox_inside_ratio": 0.0,
@@ -895,14 +1157,15 @@ def run_epoch(
         "predicted_area_ratio": 0.0,
     }
 
-    for step, (mri_images, mri_masks) in enumerate(mri_loader):
+    for step in range(steps_per_epoch):
         global_step = start_step + step
         alpha = compute_lambda_schedule(global_step, total_steps) if use_dann else 0.0
         last_alpha = alpha
 
+        mri_images, mri_masks = next(mri_iter)
+        us_images, us_weak_masks, us_bbox_masks = next(us_iter)
         mri_images = mri_images.to(device, non_blocking=True)
         mri_masks = mri_masks.to(device, non_blocking=True)
-        us_images, us_weak_masks, us_bbox_masks = next(us_iter)
         us_images = us_images.to(device, non_blocking=True)
         us_weak_masks = us_weak_masks.to(device, non_blocking=True)
         us_bbox_masks = us_bbox_masks.to(device, non_blocking=True)
@@ -942,11 +1205,13 @@ def run_epoch(
             total_loss = lambda_mri * seg_loss + lambda_us * weak_loss_us + weighted_domain
 
             debug_every = int(CONFIG.get("weak_debug_every", 0))
+            debug_max_batches = int(CONFIG.get("weak_debug_max_batches", 1))
+            debug_max_samples = int(CONFIG.get("weak_debug_max_samples", 1))
             debug_dir = str(CONFIG.get("weak_debug_dir", ""))
             if (
                 debug_every > 0
                 and debug_dir
-                and step == 0
+                and step < debug_max_batches
                 and epoch % debug_every == 0
                 and weak_mode == "bbox"
             ):
@@ -959,6 +1224,8 @@ def run_epoch(
                     step=step,
                     output_dir=debug_dir,
                     threshold=CONFIG["threshold"],
+                    max_samples=debug_max_samples,
+                    metric_thresholds=CONFIG.get("us_metric_thresholds", [0.30, 0.35, 0.40, 0.50]),
                 )
 
         scaler.scale(total_loss).backward()
@@ -969,7 +1236,7 @@ def run_epoch(
             domain_accuracy(domain_logits_mri, mri_labels)
             + domain_accuracy(domain_logits_us, us_labels)
         )
-        should_compute_metrics = (step % weak_metric_every == 0) or (step == len(mri_loader) - 1)
+        should_compute_metrics = (step % weak_metric_every == 0) or (step == steps_per_epoch - 1)
         if should_compute_metrics:
             last_us_metrics = compute_us_bbox_metrics(
                 seg_logits_us,
@@ -989,7 +1256,12 @@ def run_epoch(
         totals["weak_loss_us"] += float(weak_loss_us.item())
         totals["outside_loss"] += float(weak_parts["outside_loss"].item())
         totals["inside_presence_loss"] += float(weak_parts["inside_presence_loss"].item())
+        totals["inside_mean_loss"] += float(weak_parts["inside_mean_loss"].item())
+        totals["mean_prob_inside_bbox"] += float(weak_parts["mean_prob_inside_bbox"].item())
+        totals["topk_inside_prob"] += float(weak_parts["topk_inside_prob"].item())
         totals["area_loss"] += float(weak_parts["area_loss"].item())
+        totals["under_area_loss"] += float(weak_parts["under_area_loss"].item())
+        totals["over_area_loss"] += float(weak_parts["over_area_loss"].item())
         totals["total_loss"] += float(total_loss.item())
         totals["domain_acc"] += acc
 
@@ -997,26 +1269,35 @@ def run_epoch(
             log.info(
                 (
                     "Ep %02d | Step %4d/%d | alpha %.3f | seg_mri %.4f | "
-                    "weak_us %.4f (out %.4f | in %.4f | area %.4f) | "
+                    "weak_us %.4f (out %.4f | in %.4f | mean_loss %.4f | "
+                    "mean_prob %.4f | topk %.4f | area %.4f | under %.4f | over %.4f) | "
                     "domain_loss %.4f | total %.4f | dom_acc %.3f | bbox_in %.3f | area_ratio %.3f"
+                    " [min %.2f | max %.2f]"
                 ),
                 epoch,
                 step,
-                len(mri_loader),
+                steps_per_epoch,
                 alpha,
                 seg_loss.item(),
                 weak_loss_us.item(),
                 weak_parts["outside_loss"].item(),
                 weak_parts["inside_presence_loss"].item(),
+                weak_parts["inside_mean_loss"].item(),
+                weak_parts["mean_prob_inside_bbox"].item(),
+                weak_parts["topk_inside_prob"].item(),
                 weak_parts["area_loss"].item(),
+                weak_parts["under_area_loss"].item(),
+                weak_parts["over_area_loss"].item(),
                 domain_loss.item(),
                 total_loss.item(),
                 acc,
                 last_us_metrics["bbox_inside_ratio"],
                 last_us_metrics["predicted_area_ratio"],
+                float(CONFIG.get("weak_min_area_ratio", 0.15)),
+                float(CONFIG.get("weak_max_area_ratio", 1.0)),
             )
 
-    n_steps = max(1, len(mri_loader))
+    n_steps = steps_per_epoch
     stats = {key: value / n_steps for key, value in totals.items()}
     metric_denominator = max(1, metric_count)
     for key in ("bbox_inside_ratio", "bbox_iou", "bbox_centroid_inside", "predicted_area_ratio"):
@@ -1043,8 +1324,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lambda_domain",
         type=float,
-        default=float(CONFIG.get("lambda_domain", 0.03)),
-        help="Peso bajo para regularizacion adversarial DANN.",
+        default=float(CONFIG.get("lambda_domain", 0.0)),
+        help="Peso para regularizacion adversarial DANN. Default: 0.0.",
     )
     parser.add_argument(
         "--use_dann",
@@ -1074,6 +1355,16 @@ def parse_args() -> argparse.Namespace:
         default=float(CONFIG.get("weak_min_inside_activation", 0.20)),
     )
     parser.add_argument(
+        "--min_inside_mean",
+        type=float,
+        default=float(CONFIG.get("weak_min_inside_mean", 0.08)),
+    )
+    parser.add_argument(
+        "--inside_mean_weight",
+        type=float,
+        default=float(CONFIG.get("weak_inside_mean_weight", 0.5)),
+    )
+    parser.add_argument(
         "--max_area_ratio",
         type=float,
         default=float(CONFIG.get("weak_max_area_ratio", 1.5)),
@@ -1082,7 +1373,10 @@ def parse_args() -> argparse.Namespace:
         "--weak_debug_dir",
         type=str,
         default=str(CONFIG.get("weak_debug_dir", "")),
-        help="Directorio opcional para guardar debug visual de la weak loss.",
+        help=(
+            "Compatibilidad legacy. En corridas nuevas el debug se guarda en "
+            "logs/checkpoints/<run_slug>/debug."
+        ),
     )
     parser.add_argument(
         "--weak_debug_every",
@@ -1090,7 +1384,62 @@ def parse_args() -> argparse.Namespace:
         default=int(CONFIG.get("weak_debug_every", 0)),
         help="Guardar debug visual cada N epocas. 0 desactiva.",
     )
+    parser.add_argument(
+        "--weak_debug_max_batches",
+        type=int,
+        default=int(CONFIG.get("weak_debug_max_batches", 1)),
+        help="Maximo de batches US por epoca para guardar debug visual.",
+    )
+    parser.add_argument(
+        "--weak_debug_max_samples",
+        type=int,
+        default=int(CONFIG.get("weak_debug_max_samples", 1)),
+        help="Maximo de samples US por batch para guardar debug visual.",
+    )
+    parser.add_argument(
+        "--us_metric_thresholds",
+        type=str,
+        default=",".join(str(v) for v in CONFIG.get("us_metric_thresholds", [0.30, 0.35, 0.40, 0.50])),
+        help="Thresholds separados por coma para metricas US de debug.",
+    )
+    parser.add_argument(
+        "--target_steps_per_epoch",
+        type=int,
+        default=int(CONFIG.get("target_steps_per_epoch", 0)),
+        help="Steps por epoca target. <=0 usa len(us_loader) para ver US una vez por epoca.",
+    )
     return parser.parse_args()
+
+
+def parse_threshold_list(raw: str) -> list[float]:
+    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("us_metric_thresholds no puede quedar vacio.")
+    return values
+
+
+def safe_run_slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.=-]+", "_", text).strip("_")
+
+
+def build_run_slug(run_id: str, lambda_us: float, lambda_domain: float, use_dann: bool, weak_mode: str) -> str:
+    suffix = f"{weak_mode}_us{lambda_us:g}"
+    if use_dann:
+        suffix += f"_dom{lambda_domain:g}_dann1"
+    return safe_run_slug(f"{run_id}_{suffix}")
+
+
+def write_run_config(run_dir: Path, run_id: str, run_slug: str) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "run_slug": run_slug,
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "target_score_weights": TARGET_SCORE_WEIGHTS,
+        "config": CONFIG,
+    }
+    with (run_dir / "run_config.json").open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
 
 
 def train(args: argparse.Namespace | None = None) -> None:
@@ -1103,15 +1452,23 @@ def train(args: argparse.Namespace | None = None) -> None:
     lambda_domain = args.lambda_domain
     use_dann = args.use_dann
     weak_mode = args.weak_mode
+    run_slug = build_run_slug(run_id, lambda_us, lambda_domain, use_dann, weak_mode)
     CONFIG["weak_loss_type"] = args.weak_loss_type
     CONFIG["weak_bbox_margin_px"] = args.bbox_margin_px
     CONFIG["weak_outside_weight"] = args.outside_weight
     CONFIG["weak_inside_weight"] = args.inside_weight
     CONFIG["weak_area_weight"] = args.area_weight
     CONFIG["weak_min_inside_activation"] = args.min_inside_activation
+    CONFIG["weak_min_inside_mean"] = args.min_inside_mean
+    CONFIG["weak_inside_mean_weight"] = args.inside_mean_weight
     CONFIG["weak_max_area_ratio"] = args.max_area_ratio
-    CONFIG["weak_debug_dir"] = args.weak_debug_dir
     CONFIG["weak_debug_every"] = args.weak_debug_every
+    CONFIG["weak_debug_max_batches"] = args.weak_debug_max_batches
+    CONFIG["weak_debug_max_samples"] = args.weak_debug_max_samples
+    CONFIG["us_metric_thresholds"] = parse_threshold_list(args.us_metric_thresholds)
+    CONFIG["lambda_domain"] = lambda_domain
+    CONFIG["use_dann"] = use_dann
+    CONFIG["target_steps_per_epoch"] = args.target_steps_per_epoch
     freeze_decoder_epochs = CONFIG.get("freeze_decoder_epochs", 0)
     log_every = CONFIG.get("log_every", 10)
     use_amp = bool(CONFIG.get("use_amp", device.type == "cuda")) and device.type == "cuda"
@@ -1123,7 +1480,7 @@ def train(args: argparse.Namespace | None = None) -> None:
             pass
 
     log.info("=" * 60)
-    log.info("  MiomaVision - Entrenamiento DANN MRI -> US")
+    log.info("  MiomaVision - Entrenamiento target MRI -> US")
     log.info("  Run ID:      %s", run_id)
     log.info("  Dispositivo: %s", device)
     log.info("  Epocas:      %d", CONFIG["epochs"])
@@ -1134,13 +1491,27 @@ def train(args: argparse.Namespace | None = None) -> None:
     log.info("  Weak mode:   %s", weak_mode)
     log.info("  Weak loss:   %s", CONFIG["weak_loss_type"])
     log.info(
-        "  Soft bbox:   margin=%d | outside=%.3f | inside=%.3f | area=%.3f | min_inside=%.3f | max_area=%.3f",
+        "  Debug weak:  every=%d | max_batches=%d | max_samples=%d | thresholds=%s",
+        CONFIG["weak_debug_every"],
+        CONFIG["weak_debug_max_batches"],
+        CONFIG["weak_debug_max_samples"],
+        ",".join(f"{thr:.2f}" for thr in CONFIG["us_metric_thresholds"]),
+    )
+    log.info(
+        "  Soft bbox:   margin=%d | outside=%.3f | inside=%.3f | area=%.3f | "
+        "min_inside=%.3f | min_inside_mean=%.3f | mean_w=%.3f | "
+        "area_bounds=[%.3f, %.3f] | under_w=%.3f | over_w=%.3f",
         CONFIG["weak_bbox_margin_px"],
         CONFIG["weak_outside_weight"],
         CONFIG["weak_inside_weight"],
         CONFIG["weak_area_weight"],
         CONFIG["weak_min_inside_activation"],
+        CONFIG["weak_min_inside_mean"],
+        CONFIG["weak_inside_mean_weight"],
+        CONFIG["weak_min_area_ratio"],
         CONFIG["weak_max_area_ratio"],
+        CONFIG["weak_under_area_weight"],
+        CONFIG["weak_over_area_weight"],
     )
     log.info("  AMP:         %s", "ON" if use_amp else "OFF")
     log.info("  Log every:   %d step(s)", log_every)
@@ -1168,8 +1539,8 @@ def train(args: argparse.Namespace | None = None) -> None:
         us_base_path,
     )
     log.info(
-        "Dataloaders simultaneos: se itera por MRI y se usa cycle(US). "
-        "Asi cada paso tiene mascara MRI y dominio US aunque las longitudes difieran."
+        "Dataloaders simultaneos: la epoca target se gobierna por US y se usa cycle(MRI). "
+        "Asi US se ve aproximadamente una vez por epoca y MRI aporta supervision fuerte."
     )
 
     num_workers = CONFIG.get("num_workers", 0)
@@ -1241,17 +1612,31 @@ def train(args: argparse.Namespace | None = None) -> None:
         patience=CONFIG.get("lr_patience", 5),
         min_lr=CONFIG.get("lr_min", 1e-6),
     )
-    csv_path = init_target_metrics_csv(run_id)
-
-    ckpt_dir = Path(CONFIG["logs_path"]) / "checkpoints_dann"
+    ckpt_dir = Path(CONFIG["logs_path"]) / "checkpoints" / run_slug
+    CONFIG["weak_debug_dir"] = str(ckpt_dir / "debug")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_path = str(ckpt_dir / "best_model_dann.pth")
-    last_path = str(ckpt_dir / "last_model_dann.pth")
+    write_run_config(ckpt_dir, run_id, run_slug)
+    write_run_config(Path(CONFIG["weak_debug_dir"]), run_id, run_slug)
+    csv_path = init_target_metrics_csv(run_id)
+    run_csv_path = init_run_metrics_csv(ckpt_dir)
+    best_path = str(ckpt_dir / "best_model.pth")
+    last_path = str(ckpt_dir / "last_model.pth")
+    log.info("Artefactos de corrida: checkpoints=%s | debug=%s", ckpt_dir, CONFIG["weak_debug_dir"])
 
     best_dice = 0.0
-    best_weak_score = 0.0
-    total_steps = CONFIG["epochs"] * max(1, len(mri_train_loader))
+    best_target_score = -np.inf
+    configured_steps = int(CONFIG.get("target_steps_per_epoch", 0))
+    steps_per_epoch = configured_steps if configured_steps > 0 else len(us_train_loader)
+    steps_per_epoch = max(1, steps_per_epoch)
+    total_steps = CONFIG["epochs"] * steps_per_epoch
     global_step = 0
+    log.info(
+        "Steps target por epoca: %d (MRI batches=%d | US batches=%d | target_steps_per_epoch=%d)",
+        steps_per_epoch,
+        len(mri_train_loader),
+        len(us_train_loader),
+        configured_steps,
+    )
 
     for epoch in range(1, CONFIG["epochs"] + 1):
         t0 = time.time()
@@ -1275,9 +1660,10 @@ def train(args: argparse.Namespace | None = None) -> None:
             use_dann=use_dann,
             weak_mode=weak_mode,
             use_amp=use_amp,
+            steps_per_epoch=steps_per_epoch,
             log_every=log_every,
         )
-        global_step += len(mri_train_loader)
+        global_step += steps_per_epoch
 
         val_metrics, inf_batches, val_loss = validate_mri(model, mri_val_loader, device)
         val_us_metrics = validate_us_weak(model, us_val_loader, device, weak_mode)
@@ -1285,17 +1671,13 @@ def train(args: argparse.Namespace | None = None) -> None:
             log.warning("HD95=inf en %d batch(es) de validacion.", inf_batches)
 
         dice_val = val_metrics["Dice"]
-        weak_score = 0.5 * (
-            val_us_metrics["bbox_inside_ratio"] + val_us_metrics["bbox_centroid_inside"]
-        )
-        is_best = (dice_val > best_dice) or (
-            np.isclose(dice_val, best_dice) and weak_score > best_weak_score
-        )
-        scheduler.step(dice_val)
+        target_score, val_area_score = compute_target_score(val_us_metrics, dice_val)
+        is_best = target_score > best_target_score
+        scheduler.step(target_score)
 
         if is_best:
-            best_dice = dice_val
-            best_weak_score = weak_score
+            best_target_score = target_score
+            best_dice = max(best_dice, dice_val)
 
         save_checkpoint(
             last_path,
@@ -1312,6 +1694,24 @@ def train(args: argparse.Namespace | None = None) -> None:
             use_dann,
             weak_mode,
         )
+        epoch_ckpt_every = int(CONFIG.get("target_save_epoch_checkpoints", 0))
+        if epoch_ckpt_every > 0 and epoch % epoch_ckpt_every == 0:
+            epoch_path = str(ckpt_dir / f"epoch_{epoch:03d}_model.pth")
+            save_checkpoint(
+                epoch_path,
+                model,
+                optimizer,
+                epoch,
+                best_dice,
+                val_metrics,
+                val_us_metrics,
+                alpha,
+                lambda_mri,
+                lambda_us,
+                lambda_domain,
+                use_dann,
+                weak_mode,
+            )
         if is_best:
             save_checkpoint(
                 best_path,
@@ -1330,7 +1730,7 @@ def train(args: argparse.Namespace | None = None) -> None:
             )
 
         append_target_metrics(
-            csv_path,
+            [csv_path, run_csv_path],
             run_id,
             epoch,
             train_stats,
@@ -1344,6 +1744,8 @@ def train(args: argparse.Namespace | None = None) -> None:
             use_dann,
             weak_mode,
             optimizer,
+            target_score,
+            val_area_score,
             is_best,
         )
 
@@ -1352,9 +1754,12 @@ def train(args: argparse.Namespace | None = None) -> None:
         log.info(
             (
                 "Epoca %02d/%02d | total %.4f | seg_mri %.4f | weak_us %.4f "
-                "(out %.4f | in %.4f | area %.4f) | domain_loss %.4f | "
-                "val_loss %.4f | Dice %.4f | HD95 %s | dom_acc %.3f | "
-                "bbox_in %.3f | val_bbox_in %.3f | area_ratio %.3f | val_area_ratio %.3f | %.1fs%s"
+                "(out %.4f | in %.4f | mean_loss %.4f | mean_prob %.4f | "
+                "topk %.4f | area %.4f | under %.4f | over %.4f) | "
+                "domain_loss %.4f | val_loss %.4f | Dice %.4f | HD95 %s | dom_acc %.3f | "
+                "bbox_in %.3f | val_bbox_in %.3f | area_ratio %.3f | val_area_ratio %.3f | "
+                "val_under %.4f | val_over %.4f | area_bounds [%.2f, %.2f] | "
+                "val_area_score %.3f | target_score %.4f | %.1fs%s"
             ),
             epoch,
             CONFIG["epochs"],
@@ -1363,7 +1768,12 @@ def train(args: argparse.Namespace | None = None) -> None:
             train_stats["weak_loss_us"],
             train_stats["outside_loss"],
             train_stats["inside_presence_loss"],
+            train_stats["inside_mean_loss"],
+            train_stats["mean_prob_inside_bbox"],
+            train_stats["topk_inside_prob"],
             train_stats["area_loss"],
+            train_stats["under_area_loss"],
+            train_stats["over_area_loss"],
             train_stats["domain_loss"],
             val_loss,
             dice_val,
@@ -1373,14 +1783,20 @@ def train(args: argparse.Namespace | None = None) -> None:
             val_us_metrics["bbox_inside_ratio"],
             train_stats["predicted_area_ratio"],
             val_us_metrics["predicted_area_ratio"],
+            val_us_metrics["under_area_loss"],
+            val_us_metrics["over_area_loss"],
+            val_us_metrics["min_area_ratio"],
+            val_us_metrics["max_area_ratio"],
+            val_area_score,
+            target_score,
             time.time() - t0,
             " * BEST" if is_best else "",
         )
 
     log.info("=" * 60)
-    log.info("Entrenamiento DANN finalizado")
+    log.info("Entrenamiento target finalizado")
     log.info("Mejor Dice: %.4f", best_dice)
-    log.info("Mejor weak score asociado: %.4f", best_weak_score)
+    log.info("Mejor target score: %.4f", best_target_score)
     log.info("Best checkpoint: %s", best_path)
     log.info("Last checkpoint: %s", last_path)
     log.info("Metricas: %s", csv_path)
