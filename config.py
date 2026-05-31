@@ -85,6 +85,8 @@ CONFIG = {
     "weak_min_inside_activation": float(os.getenv("WEAK_MIN_INSIDE_ACTIVATION", "0.35")),
     "weak_min_inside_mean": float(os.getenv("WEAK_MIN_INSIDE_MEAN", "0.08")),
     "weak_inside_mean_weight": float(os.getenv("WEAK_INSIDE_MEAN_WEIGHT", "0.5")),
+    "weak_min_high_conf": float(os.getenv("WEAK_MIN_HIGH_CONF", "0.12")),
+    "weak_high_conf_weight": float(os.getenv("WEAK_HIGH_CONF_WEIGHT", "0.5")),
     "weak_min_area_ratio": float(os.getenv("WEAK_MIN_AREA_RATIO", "0.25")),
     "weak_max_area_ratio": float(os.getenv("WEAK_MAX_AREA_RATIO", "1.0")),
     "weak_under_area_weight": float(os.getenv("WEAK_UNDER_AREA_WEIGHT", "4.0")),

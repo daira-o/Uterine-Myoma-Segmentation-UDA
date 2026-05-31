@@ -338,6 +338,9 @@ def soft_bbox_loss(
     inside_topk_fraction: float = 0.10,
     min_inside_mean: float = 0.08,
     inside_mean_weight: float = 0.5,
+    min_high_conf: float = 0.08,
+    high_conf_weight: float = 0.5,
+    high_conf_sharpness: float = 10.0,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
@@ -365,6 +368,8 @@ def soft_bbox_loss(
     inside_mean_losses = []
     mean_inside_probs = []
     topk_inside_probs = []
+    high_conf_losses = []
+    mean_high_confs = []
     for sample_probs, sample_bbox in zip(probs, bbox_mask):
         inside_probs = sample_probs[sample_bbox.bool()]
         if inside_probs.numel() == 0:
@@ -372,19 +377,31 @@ def soft_bbox_loss(
             inside_mean_losses.append(sample_probs.new_tensor(0.0))
             mean_inside_probs.append(sample_probs.new_tensor(0.0))
             topk_inside_probs.append(sample_probs.new_tensor(0.0))
+            high_conf_losses.append(sample_probs.new_tensor(0.0))
+            mean_high_confs.append(sample_probs.new_tensor(0.0))
             continue
         k = max(1, int(round(float(inside_probs.numel()) * inside_topk_fraction)))
         topk_mean = inside_probs.topk(k).values.mean()
         mean_inside = inside_probs.mean()
+        high_conf_soft = torch.sigmoid(high_conf_sharpness * (inside_probs - 0.5))
+        mean_high_conf = high_conf_soft.mean()
         topk_inside_probs.append(topk_mean)
         mean_inside_probs.append(mean_inside)
+        mean_high_confs.append(mean_high_conf)
         inside_losses.append(F.relu(min_inside_activation - topk_mean).pow(2))
         inside_mean_losses.append(F.relu(min_inside_mean - mean_inside))
+        high_conf_losses.append(F.relu(min_high_conf - mean_high_conf))
     topk_presence_loss = torch.stack(inside_losses)
     inside_mean_loss = torch.stack(inside_mean_losses)
-    inside_presence_loss = topk_presence_loss + inside_mean_weight * inside_mean_loss
+    high_conf_loss = torch.stack(high_conf_losses)
+    inside_presence_loss = (
+        topk_presence_loss
+        + inside_mean_weight * inside_mean_loss
+        + high_conf_weight * high_conf_loss
+    )
     mean_prob_inside_bbox = torch.stack(mean_inside_probs)
     topk_inside_prob = torch.stack(topk_inside_probs)
+    mean_high_conf = torch.stack(mean_high_confs)
 
     # Una mascara vacia tiene area 0. Si solo penalizamos exceso de area,
     # la solucion vacia puede volverse optima cuando outside_loss domina.
@@ -407,6 +424,8 @@ def soft_bbox_loss(
         "inside_mean_loss": inside_mean_loss.mean(),
         "mean_prob_inside_bbox": mean_prob_inside_bbox.mean(),
         "topk_inside_prob": topk_inside_prob.mean(),
+        "high_conf_loss": high_conf_loss.mean(),
+        "mean_high_conf": mean_high_conf.mean(),
         "area_loss": area_loss.mean(),
         "under_area_loss": under_area.mean(),
         "over_area_loss": over_area.mean(),
@@ -443,6 +462,8 @@ def compute_us_weak_loss(
                 inside_topk_fraction=float(CONFIG.get("weak_inside_fraction", 0.10)),
                 min_inside_mean=float(CONFIG.get("weak_min_inside_mean", 0.08)),
                 inside_mean_weight=float(CONFIG.get("weak_inside_mean_weight", 0.5)),
+                min_high_conf=float(CONFIG.get("weak_min_high_conf", 0.08)),
+                high_conf_weight=float(CONFIG.get("weak_high_conf_weight", 0.5)),
             )
         if weak_loss_type == "legacy_bbox":
             loss = weak_bbox_loss(
@@ -459,6 +480,8 @@ def compute_us_weak_loss(
                 "inside_mean_loss": zero,
                 "mean_prob_inside_bbox": zero,
                 "topk_inside_prob": zero,
+                "high_conf_loss": zero,
+                "mean_high_conf": zero,
                 "area_loss": zero,
                 "under_area_loss": zero,
                 "over_area_loss": zero,
@@ -475,6 +498,8 @@ def compute_us_weak_loss(
             "inside_mean_loss": zero,
             "mean_prob_inside_bbox": zero,
             "topk_inside_prob": zero,
+            "high_conf_loss": zero,
+            "mean_high_conf": zero,
             "area_loss": zero,
             "under_area_loss": zero,
             "over_area_loss": zero,
@@ -588,6 +613,8 @@ def validate_us_weak(
             "inside_mean_loss": 0.0,
             "mean_prob_inside_bbox": 0.0,
             "topk_inside_prob": 0.0,
+            "high_conf_loss": 0.0,
+            "mean_high_conf": 0.0,
             "area_loss": 0.0,
             "under_area_loss": 0.0,
             "over_area_loss": 0.0,
@@ -607,6 +634,8 @@ def validate_us_weak(
         "inside_mean_loss": [],
         "mean_prob_inside_bbox": [],
         "topk_inside_prob": [],
+        "high_conf_loss": [],
+        "mean_high_conf": [],
         "area_loss": [],
         "under_area_loss": [],
         "over_area_loss": [],
@@ -630,6 +659,8 @@ def validate_us_weak(
                 "inside_mean_loss",
                 "mean_prob_inside_bbox",
                 "topk_inside_prob",
+                "high_conf_loss",
+                "mean_high_conf",
                 "area_loss",
                 "under_area_loss",
                 "over_area_loss",
@@ -657,6 +688,12 @@ def validate_us_weak(
         else 0.0,
         "topk_inside_prob": float(np.mean(metrics["topk_inside_prob"]))
         if metrics["topk_inside_prob"]
+        else 0.0,
+        "high_conf_loss": float(np.mean(metrics["high_conf_loss"]))
+        if metrics["high_conf_loss"]
+        else 0.0,
+        "mean_high_conf": float(np.mean(metrics["mean_high_conf"]))
+        if metrics["mean_high_conf"]
         else 0.0,
         "area_loss": float(np.mean(metrics["area_loss"])) if metrics["area_loss"] else 0.0,
         "under_area_loss": float(np.mean(metrics["under_area_loss"]))
@@ -693,6 +730,8 @@ _CSV_HEADER = [
     "inside_mean_loss",
     "mean_prob_inside_bbox",
     "topk_inside_prob",
+    "high_conf_loss",
+    "mean_high_conf",
     "area_loss",
     "under_area_loss",
     "over_area_loss",
@@ -714,6 +753,8 @@ _CSV_HEADER = [
     "val_inside_mean_loss",
     "val_mean_prob_inside_bbox",
     "val_topk_inside_prob",
+    "val_high_conf_loss",
+    "val_mean_high_conf",
     "val_area_loss",
     "val_under_area_loss",
     "val_over_area_loss",
@@ -843,6 +884,8 @@ def append_target_metrics(
         f"{train_stats['inside_mean_loss']:.6f}",
         f"{train_stats['mean_prob_inside_bbox']:.6f}",
         f"{train_stats['topk_inside_prob']:.6f}",
+        f"{train_stats['high_conf_loss']:.6f}",
+        f"{train_stats['mean_high_conf']:.6f}",
         f"{train_stats['area_loss']:.6f}",
         f"{train_stats['under_area_loss']:.6f}",
         f"{train_stats['over_area_loss']:.6f}",
@@ -864,6 +907,8 @@ def append_target_metrics(
         f"{val_us_metrics['inside_mean_loss']:.6f}",
         f"{val_us_metrics['mean_prob_inside_bbox']:.6f}",
         f"{val_us_metrics['topk_inside_prob']:.6f}",
+        f"{val_us_metrics['high_conf_loss']:.6f}",
+        f"{val_us_metrics['mean_high_conf']:.6f}",
         f"{val_us_metrics['area_loss']:.6f}",
         f"{val_us_metrics['under_area_loss']:.6f}",
         f"{val_us_metrics['over_area_loss']:.6f}",
@@ -1138,6 +1183,8 @@ def run_epoch(
         "inside_mean_loss": 0.0,
         "mean_prob_inside_bbox": 0.0,
         "topk_inside_prob": 0.0,
+        "high_conf_loss": 0.0,
+        "mean_high_conf": 0.0,
         "area_loss": 0.0,
         "under_area_loss": 0.0,
         "over_area_loss": 0.0,
@@ -1259,6 +1306,8 @@ def run_epoch(
         totals["inside_mean_loss"] += float(weak_parts["inside_mean_loss"].item())
         totals["mean_prob_inside_bbox"] += float(weak_parts["mean_prob_inside_bbox"].item())
         totals["topk_inside_prob"] += float(weak_parts["topk_inside_prob"].item())
+        totals["high_conf_loss"] += float(weak_parts["high_conf_loss"].item())
+        totals["mean_high_conf"] += float(weak_parts["mean_high_conf"].item())
         totals["area_loss"] += float(weak_parts["area_loss"].item())
         totals["under_area_loss"] += float(weak_parts["under_area_loss"].item())
         totals["over_area_loss"] += float(weak_parts["over_area_loss"].item())
@@ -1270,7 +1319,8 @@ def run_epoch(
                 (
                     "Ep %02d | Step %4d/%d | alpha %.3f | seg_mri %.4f | "
                     "weak_us %.4f (out %.4f | in %.4f | mean_loss %.4f | "
-                    "mean_prob %.4f | topk %.4f | area %.4f | under %.4f | over %.4f) | "
+                    "mean_prob %.4f | topk %.4f | high_conf_loss %.4f | "
+                    "mean_high_conf %.4f | area %.4f | under %.4f | over %.4f) | "
                     "domain_loss %.4f | total %.4f | dom_acc %.3f | bbox_in %.3f | area_ratio %.3f"
                     " [min %.2f | max %.2f]"
                 ),
@@ -1285,6 +1335,8 @@ def run_epoch(
                 weak_parts["inside_mean_loss"].item(),
                 weak_parts["mean_prob_inside_bbox"].item(),
                 weak_parts["topk_inside_prob"].item(),
+                weak_parts["high_conf_loss"].item(),
+                weak_parts["mean_high_conf"].item(),
                 weak_parts["area_loss"].item(),
                 weak_parts["under_area_loss"].item(),
                 weak_parts["over_area_loss"].item(),
@@ -1363,6 +1415,16 @@ def parse_args() -> argparse.Namespace:
         "--inside_mean_weight",
         type=float,
         default=float(CONFIG.get("weak_inside_mean_weight", 0.5)),
+    )
+    parser.add_argument(
+        "--min_high_conf",
+        type=float,
+        default=float(CONFIG.get("weak_min_high_conf", 0.08)),
+    )
+    parser.add_argument(
+        "--high_conf_weight",
+        type=float,
+        default=float(CONFIG.get("weak_high_conf_weight", 0.5)),
     )
     parser.add_argument(
         "--max_area_ratio",
@@ -1461,6 +1523,8 @@ def train(args: argparse.Namespace | None = None) -> None:
     CONFIG["weak_min_inside_activation"] = args.min_inside_activation
     CONFIG["weak_min_inside_mean"] = args.min_inside_mean
     CONFIG["weak_inside_mean_weight"] = args.inside_mean_weight
+    CONFIG["weak_min_high_conf"] = args.min_high_conf
+    CONFIG["weak_high_conf_weight"] = args.high_conf_weight
     CONFIG["weak_max_area_ratio"] = args.max_area_ratio
     CONFIG["weak_debug_every"] = args.weak_debug_every
     CONFIG["weak_debug_max_batches"] = args.weak_debug_max_batches
@@ -1500,6 +1564,7 @@ def train(args: argparse.Namespace | None = None) -> None:
     log.info(
         "  Soft bbox:   margin=%d | outside=%.3f | inside=%.3f | area=%.3f | "
         "min_inside=%.3f | min_inside_mean=%.3f | mean_w=%.3f | "
+        "min_high_conf=%.3f | high_conf_w=%.3f | "
         "area_bounds=[%.3f, %.3f] | under_w=%.3f | over_w=%.3f",
         CONFIG["weak_bbox_margin_px"],
         CONFIG["weak_outside_weight"],
@@ -1508,6 +1573,8 @@ def train(args: argparse.Namespace | None = None) -> None:
         CONFIG["weak_min_inside_activation"],
         CONFIG["weak_min_inside_mean"],
         CONFIG["weak_inside_mean_weight"],
+        CONFIG["weak_min_high_conf"],
+        CONFIG["weak_high_conf_weight"],
         CONFIG["weak_min_area_ratio"],
         CONFIG["weak_max_area_ratio"],
         CONFIG["weak_under_area_weight"],
@@ -1755,7 +1822,8 @@ def train(args: argparse.Namespace | None = None) -> None:
             (
                 "Epoca %02d/%02d | total %.4f | seg_mri %.4f | weak_us %.4f "
                 "(out %.4f | in %.4f | mean_loss %.4f | mean_prob %.4f | "
-                "topk %.4f | area %.4f | under %.4f | over %.4f) | "
+                "topk %.4f | high_conf_loss %.4f | mean_high_conf %.4f | "
+                "area %.4f | under %.4f | over %.4f) | "
                 "domain_loss %.4f | val_loss %.4f | Dice %.4f | HD95 %s | dom_acc %.3f | "
                 "bbox_in %.3f | val_bbox_in %.3f | area_ratio %.3f | val_area_ratio %.3f | "
                 "val_under %.4f | val_over %.4f | area_bounds [%.2f, %.2f] | "
@@ -1771,6 +1839,8 @@ def train(args: argparse.Namespace | None = None) -> None:
             train_stats["inside_mean_loss"],
             train_stats["mean_prob_inside_bbox"],
             train_stats["topk_inside_prob"],
+            train_stats["high_conf_loss"],
+            train_stats["mean_high_conf"],
             train_stats["area_loss"],
             train_stats["under_area_loss"],
             train_stats["over_area_loss"],
