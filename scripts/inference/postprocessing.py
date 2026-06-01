@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,8 @@ from typing import Any
 
 import matplotlib
 
-matplotlib.use("Agg")
+if "MPLBACKEND" not in os.environ:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
@@ -308,6 +310,7 @@ def postprocess_prediction(
     closing_kernel_px: int = 3,
 ) -> PostprocessResult:
     boxes = (boxes or [])[:1]
+    prob = np.asarray(prob, dtype=np.float32)
     mask_before = (prob >= threshold).astype(np.uint8)
     original_area = int(mask_before.sum())
     expanded_boxes = expand_bboxes(boxes, bbox_margin_px, mask_before.shape)
