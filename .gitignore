@@ -33,3 +33,6 @@ debug.zip
 
 # Jupyter Notebooks checkpoints
 .ipynb_checkpoints/
+
+*.pdf
+*.pptx
