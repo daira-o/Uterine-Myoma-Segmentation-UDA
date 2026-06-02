@@ -41,10 +41,6 @@ from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0. Configuración global
-# ─────────────────────────────────────────────────────────────────────────────
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -59,9 +55,9 @@ IMG_SUFFIX: str = os.getenv("NIFTI_IMG_SUFFIX", "_t2")
 MASK_SUFFIX: str = os.getenv("NIFTI_MASK_SUFFIX", "_seg")
 IMAGE_SIZE: int = int(os.getenv("PROCESSOR_IMAGE_SIZE", "256"))
 
-TARGET_SPACING_MM: float = 0.8   # resolución isométrica objetivo
-MIN_MASK_AREA_PX: int = 150      # umbral mínimo de píxeles útiles en la máscara
-RANDOM_STATE: int = 42           # semilla para reproducibilidad de la división
+TARGET_SPACING_MM: float = 0.8
+MIN_MASK_AREA_PX: int = 150
+RANDOM_STATE: int = 42
 
 SPLITS: dict[str, float] = {"train": 0.80, "val": 0.10, "test": 0.10}
 
@@ -72,10 +68,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. División física a nivel de paciente
-# ─────────────────────────────────────────────────────────────────────────────
 
 def split_patients(
     base_path: str,
@@ -109,7 +101,6 @@ def split_patients(
     if not all_folders:
         raise FileNotFoundError(f"No se encontraron subcarpetas en: {base_path}")
 
-    # Primera división: train vs (val + test)
     holdout_ratio = val_ratio + test_ratio
     train_folders, holdout_folders = train_test_split(
         all_folders,
@@ -118,7 +109,6 @@ def split_patients(
         shuffle=True,
     )
 
-    # Segunda división: val vs test dentro del holdout
     relative_test_ratio = test_ratio / holdout_ratio
     val_folders, test_folders = train_test_split(
         holdout_folders,
@@ -177,10 +167,6 @@ def build_output_dirs(output_path: str) -> dict[str, dict[str, str]]:
     return paths
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Carga y canonización de orientación
-# ─────────────────────────────────────────────────────────────────────────────
-
 def load_canonical_nifti(
     nifti_path: str,
 ) -> Optional[tuple[np.ndarray, nib.nifti1.Nifti1Header]]:
@@ -210,17 +196,13 @@ def load_canonical_nifti(
     """
     try:
         img = nib.load(nifti_path)
-        img_canonical = nib.as_closest_canonical(img)   # ← orientación RAS+
+        img_canonical = nib.as_closest_canonical(img)
         data = img_canonical.get_fdata(dtype=np.float32)
         return data, img_canonical.header
     except Exception as exc:  # noqa: BLE001
         log.warning("No se pudo cargar '%s': %s. Saltando...", nifti_path, exc)
         return None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3 + 4. Extracción y filtrado de cortes 2D
-# ─────────────────────────────────────────────────────────────────────────────
 
 SAG_AXIS: int = 0  # Eje sagital tras canonizacion RAS+
 
@@ -257,7 +239,7 @@ def extract_valid_slices(
     n_slices = vol_img.shape[SAG_AXIS]
 
     for i in range(n_slices):
-        img_slice = vol_img[i, :, :]   # Eje 0 -> vol[i, :, :]
+        img_slice = vol_img[i, :, :]
         seg_slice = vol_seg[i, :, :]
 
         mask_area = int(np.sum(seg_slice > 0))
@@ -266,10 +248,6 @@ def extract_valid_slices(
 
     return valid
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Resampling físico a TARGET_SPACING_MM
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_inplane_spacings(
     header: nib.nifti1.Nifti1Header,
@@ -282,8 +260,8 @@ def get_inplane_spacings(
     -------
     (spacing_row, spacing_col) en mm/px.
     """
-    pixdim = header.get_zooms()          # (sx, sy, sz) mm/px tras canonizacion
     # Los cortes son vol[i, :, :] -> dimensiones en el plano son ejes 1 y 2.
+    pixdim = header.get_zooms()
     return float(pixdim[1]), float(pixdim[2])
 
 
@@ -329,15 +307,12 @@ def resample_slice(
     """
     h_px, w_px = img_slice.shape
 
-    # Tamaño físico total en mm
     h_mm = h_px * spacing_row
     w_mm = w_px * spacing_col
 
-    # Nuevas dimensiones a la resolución objetivo
     new_h = max(1, round(h_mm / target_spacing))
     new_w = max(1, round(w_mm / target_spacing))
 
-    # cv2.resize recibe (width, height)
     img_res = cv2.resize(
         img_slice.astype(np.float32),
         (new_w, new_h),
@@ -350,10 +325,6 @@ def resample_slice(
     )
     return img_res, seg_res
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Center Crop / Padding a IMAGE_SIZE × IMAGE_SIZE
-# ─────────────────────────────────────────────────────────────────────────────
 
 def pad_or_crop_center(
     arr: np.ndarray,
@@ -387,7 +358,6 @@ def pad_or_crop_center(
     h, w = arr.shape
     out = np.zeros((target_h, target_w), dtype=arr.dtype)
 
-    # ── Eje vertical (filas) ─────────────────────────────────────────────────
     if h <= target_h:
         pad_top = (target_h - h) // 2
         src_r0, src_r1 = 0, h
@@ -397,7 +367,6 @@ def pad_or_crop_center(
         src_r0, src_r1 = crop_top, crop_top + target_h
         dst_r0, dst_r1 = 0, target_h
 
-    # ── Eje horizontal (columnas) ────────────────────────────────────────────
     if w <= target_w:
         pad_left = (target_w - w) // 2
         src_c0, src_c1 = 0, w
@@ -410,10 +379,6 @@ def pad_or_crop_center(
     out[dst_r0:dst_r1, dst_c0:dst_c1] = arr[src_r0:src_r1, src_c0:src_c1]
     return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Normalización Min-Max de la imagen
-# ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_minmax(img: np.ndarray) -> np.ndarray:
     """
@@ -434,10 +399,6 @@ def normalize_minmax(img: np.ndarray) -> np.ndarray:
         return img.astype(np.float32)
     return ((img - vmin) / diff).astype(np.float32)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. Clase principal del pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 class MRIPipelineProcessor:
     """
@@ -491,8 +452,6 @@ class MRIPipelineProcessor:
         self.target_spacing = target_spacing
         self.min_mask_area = min_mask_area
 
-    # ── Métodos auxiliares internos ──────────────────────────────────────────
-
     def _find_nifti(self, folder: str, suffix: str) -> Optional[str]:
         """
         Busca el primer archivo .nii o .nii.gz cuyo nombre termina en `suffix`.
@@ -522,7 +481,6 @@ class MRIPipelineProcessor:
         """
         patient_id = os.path.basename(folder)
 
-        # ── Búsqueda de archivos NIfTI ────────────────────────────────────
         img_path = self._find_nifti(folder, self.img_suffix)
         seg_path = self._find_nifti(folder, self.mask_suffix)
 
@@ -530,7 +488,6 @@ class MRIPipelineProcessor:
             log.warning("Paciente '%s': falta imagen o máscara. Saltando.", patient_id)
             return 0
 
-        # ── Carga y canonización RAS+ ─────────────────────────────────────
         result_img = load_canonical_nifti(img_path)
         result_seg = load_canonical_nifti(seg_path)
 
@@ -540,7 +497,6 @@ class MRIPipelineProcessor:
         vol_img, header = result_img
         vol_seg, _ = result_seg
 
-        # Verificación de consistencia de dimensiones
         if vol_img.shape != vol_seg.shape:
             log.warning(
                 "Paciente '%s': imagen %s y máscara %s tienen formas distintas. Saltando.",
@@ -548,33 +504,27 @@ class MRIPipelineProcessor:
             )
             return 0
 
-        # ── Spacings físicos en el plano (ejes 1 y 2 tras canonización) ───
         spacing_row, spacing_col = get_inplane_spacings(header)
 
-        # ── Extracción y filtrado de cortes 2D ────────────────────────────
         valid_slices = extract_valid_slices(vol_img, vol_seg, self.min_mask_area)
 
         saved_count = 0
         for slice_idx, img_slice, seg_slice in valid_slices:
 
-            # ── Normalización Min-Max ─────────────────────────────────────
             img_norm = normalize_minmax(img_slice)
 
-            # ── Resampling físico a TARGET_SPACING_MM mm/px ───────────────
             img_res, seg_res = resample_slice(
                 img_norm, seg_slice,
                 spacing_row, spacing_col,
                 self.target_spacing,
             )
 
-            # ── Center Crop / Padding a IMAGE_SIZE × IMAGE_SIZE ───────────
             img_out = pad_or_crop_center(img_res, self.image_size, self.image_size)
             seg_out = pad_or_crop_center(seg_res, self.image_size, self.image_size)
 
-            # Binarización robusta de la máscara (elimina artefactos float)
+            # Evita etiquetas fraccionales tras resize/crop.
             seg_out = (seg_out > 0).astype(np.float32)
 
-            # ── Guardado individual como .npy ─────────────────────────────
             file_id = f"{patient_id}_sag_{slice_idx}"
             np.save(
                 os.path.join(out_dirs["images"], f"{file_id}.npy"),
@@ -588,8 +538,6 @@ class MRIPipelineProcessor:
 
         return saved_count
 
-    # ── Método público principal ─────────────────────────────────────────────
-
     def run(self) -> None:
         """
         Ejecuta el pipeline completo en el orden definido.
@@ -602,20 +550,15 @@ class MRIPipelineProcessor:
         log.info("  Spacing   : %.1f mm/px  |  Tile: %d px", self.target_spacing, self.image_size)
         log.info("═" * 60)
 
-        # ── Paso 1: División de pacientes ────────────────────────────────────
         splits = split_patients(
             self.base_path,
             val_ratio=SPLITS["val"],
             test_ratio=SPLITS["test"],
         )
 
-        # ── Paso 2: Creación de directorios ──────────────────────────────────
         out_dirs = build_output_dirs(self.output_path)
-
-        # ── Paso 3: Exportar manifiesto JSON ─────────────────────────────────
         save_split_manifest(splits, self.output_path)
 
-        # ── Pasos 4–7: Procesar cada split ───────────────────────────────────
         total_stats: dict[str, int] = {}
 
         for split_name, folders in splits.items():
@@ -629,7 +572,6 @@ class MRIPipelineProcessor:
             total_stats[split_name] = split_slices
             log.info("Split %-5s → %d cortes guardados", split_name, split_slices)
 
-        # ── Resumen final ────────────────────────────────────────────────────
         log.info("─" * 60)
         log.info("  RESUMEN FINAL")
         for split_name, count in total_stats.items():
@@ -638,10 +580,6 @@ class MRIPipelineProcessor:
         log.info("═" * 60)
         log.info("  Pipeline completado. Datos listos en: %s", self.output_path)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     pipeline = MRIPipelineProcessor(

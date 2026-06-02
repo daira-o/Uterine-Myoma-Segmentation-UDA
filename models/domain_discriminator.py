@@ -80,22 +80,19 @@ class DomainDiscriminator(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.gap = nn.AdaptiveAvgPool2d(1)   # [B, C, H, W] → [B, C, 1, 1]
+        self.gap = nn.AdaptiveAvgPool2d(1)
 
         self.classifier = nn.Sequential(
-            # Capa 1
             nn.Linear(in_channels, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout_rate),
 
-            # Capa 2
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout_rate),
 
-            # Salida
             nn.Linear(hidden_dim // 2, num_domains),
         )
 
@@ -121,14 +118,12 @@ class DomainDiscriminator(nn.Module):
             logits [B, num_domains] — pasar por CrossEntropyLoss.
         """
         if x.dim() == 4:
-            x = self.gap(x)         # [B, C, 1, 1]
-            x = x.view(x.size(0), -1)  # [B, C]
-        elif x.dim() == 2:
-            pass  # ya aplanado
-        else:
+            x = self.gap(x)
+            x = x.view(x.size(0), -1)
+        elif x.dim() != 2:
             raise ValueError(f"DomainDiscriminator espera 2D o 4D, recibió {x.dim()}D")
 
-        return self.classifier(x)   # [B, num_domains]
+        return self.classifier(x)
 
 
 class MultiScaleDomainDiscriminator(nn.Module):
@@ -163,11 +158,10 @@ class MultiScaleDomainDiscriminator(nn.Module):
         super().__init__()
 
         if channels_list is None:
-            channels_list = [256, 512, 1024]  # enc3, enc4, bottleneck para base=64
+            channels_list = [256, 512, 1024]
 
         self.gap = nn.AdaptiveAvgPool2d(1)
 
-        # Proyecciones por rama
         self.projections = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(ch, proj_dim),
@@ -197,8 +191,8 @@ class MultiScaleDomainDiscriminator(nn.Module):
         """
         projected = []
         for feat, proj in zip(features_list, self.projections):
-            pooled = self.gap(feat).view(feat.size(0), -1)  # [B, C_i]
-            projected.append(proj(pooled))                   # [B, proj_dim]
+            pooled = self.gap(feat).view(feat.size(0), -1)
+            projected.append(proj(pooled))
 
         fused = torch.cat(projected, dim=1)   # [B, proj_dim * n_scales]
         return self.classifier(fused)

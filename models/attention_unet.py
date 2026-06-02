@@ -1,7 +1,7 @@
 """
 attention_unet.py
 Arquitectura Attention U-Net en PyTorch.
-Compatible con CUDA 12.8 / RTX 5060 (Blackwell).
+
 
 Métricas ampliadas según el framework Metrics Reloaded:
   - Dice Coefficient          (overlap semántico)
@@ -14,12 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from scipy.ndimage import label as scipy_label
-from scipy.spatial.distance import directed_hausdorff
 
-
-# ─────────────────────────────────────────────
-#  MÉTRICAS — NIVEL SEMÁNTICO
-# ─────────────────────────────────────────────
 
 def dice_coef(y_pred: torch.Tensor, y_true: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
     """
@@ -50,10 +45,6 @@ def bce_dice_loss(y_pred: torch.Tensor, y_true: torch.Tensor, bce_weight: float 
     return bce_weight * bce + (1 - bce_weight) * dice
 
 
-# ─────────────────────────────────────────────
-#  MÉTRICAS — NIVEL DE BORDES (HD95)
-# ─────────────────────────────────────────────
-
 def compute_hd95(pred_bin: np.ndarray, mask_bin: np.ndarray) -> float:
     """
     Hausdorff Distance al percentil 95 entre dos máscaras binarias 2-D.
@@ -77,19 +68,12 @@ def compute_hd95(pred_bin: np.ndarray, mask_bin: np.ndarray) -> float:
     pred_pts = np.argwhere(pred_bin)
     gt_pts   = np.argwhere(mask_bin)
 
-    # Caso 1: ambas vacías (verdadero negativo global)
     if len(pred_pts) == 0 and len(gt_pts) == 0:
         return 0.0
 
-    # Caso 2: una sola vacía — predicción incorrecta de presencia/ausencia
     if len(pred_pts) == 0 or len(gt_pts) == 0:
         return np.inf
 
-    # Distancias de Hausdorff dirigidas en ambas direcciones
-    d_pred_to_gt = directed_hausdorff(pred_pts, gt_pts)[0]
-    d_gt_to_pred = directed_hausdorff(gt_pts, pred_pts)[0]
-
-    # HD95: percentil 95 sobre todas las distancias punto-a-conjunto más cercano
     from scipy.spatial import cKDTree
 
     tree_gt   = cKDTree(gt_pts)
@@ -127,10 +111,6 @@ def batch_hd95(preds_bin: torch.Tensor, masks_bin: torch.Tensor) -> float:
         return np.inf
     return float(np.mean(finite_vals))
 
-
-# ─────────────────────────────────────────────
-#  MÉTRICAS — NIVEL DE INSTANCIA (Object Precision)
-# ─────────────────────────────────────────────
 
 def _get_connected_components(binary_mask: np.ndarray):
     """
@@ -176,7 +156,6 @@ def compute_object_precision(
     pred_labeled, n_pred = _get_connected_components(pred_bin)
     gt_labeled,   n_gt   = _get_connected_components(mask_bin)
 
-    # Sin predicciones → precisión perfecta (no hay FP)
     if n_pred == 0:
         return 1.0
 
@@ -188,7 +167,6 @@ def compute_object_precision(
         if pred_area == 0:
             continue
 
-        # ¿Cuánto de este objeto predicho se superpone con cualquier GT?
         overlap = (pred_obj & (gt_labeled > 0)).sum()
         overlap_ratio = overlap / pred_area
 
@@ -226,10 +204,6 @@ def batch_object_precision(
     return float(np.mean(precisions))
 
 
-# ─────────────────────────────────────────────
-#  MÉTRICAS — FUNCIÓN DE REPORTE UNIFICADA
-# ─────────────────────────────────────────────
-
 def compute_all_metrics(
     logits: torch.Tensor,
     masks: torch.Tensor,
@@ -258,10 +232,7 @@ def compute_all_metrics(
         probs    = torch.sigmoid(logits.float())
         preds_bin = (probs >= threshold).float()
 
-        # ── Dice (opera sobre tensores, rápido) ──────────────────────────
         dice = dice_coef(preds_bin, masks.float()).item()
-
-        # ── HD95 y Object Precision (operan sobre numpy, por sample) ─────
         hd95      = batch_hd95(preds_bin, masks)
         obj_prec  = batch_object_precision(preds_bin, masks, iou_threshold)
 
@@ -271,10 +242,6 @@ def compute_all_metrics(
         "Object_Precision": obj_prec,
     }
 
-
-# ─────────────────────────────────────────────
-#  BLOQUES CONSTRUCTORES
-# ─────────────────────────────────────────────
 
 class ConvBlock(nn.Module):
     """Doble convolución con BN y ReLU opcional Dropout."""
@@ -335,10 +302,6 @@ class AttentionBlock(nn.Module):
         return self.bn(y)
 
 
-# ─────────────────────────────────────────────
-#  RED COMPLETA
-# ─────────────────────────────────────────────
-
 class AttentionUNet(nn.Module):
     """
     Attention U-Net para segmentación de imágenes médicas.
@@ -362,28 +325,23 @@ class AttentionUNet(nn.Module):
         super().__init__()
         f = base_filters
 
-        # ── Encoder ──────────────────────────────
         self.enc1 = ConvBlock(in_channels, f,    dropout_rate, batch_norm)
         self.enc2 = ConvBlock(f,           f*2,  dropout_rate, batch_norm)
         self.enc3 = ConvBlock(f*2,         f*4,  dropout_rate, batch_norm)
         self.enc4 = ConvBlock(f*4,         f*8,  dropout_rate, batch_norm)
 
-        # ── Bottleneck ───────────────────────────
         self.bottleneck = ConvBlock(f*8, f*16, dropout_rate, batch_norm)
 
-        # ── Gating signals ───────────────────────
         self.gate4 = GatingSignal(f*16, f*8,  batch_norm)
         self.gate3 = GatingSignal(f*8,  f*4,  batch_norm)
         self.gate2 = GatingSignal(f*4,  f*2,  batch_norm)
         self.gate1 = GatingSignal(f*2,  f,    batch_norm)
 
-        # ── Attention blocks ─────────────────────
         self.att4 = AttentionBlock(f*8,  f*8,  f*8)
         self.att3 = AttentionBlock(f*4,  f*4,  f*4)
         self.att2 = AttentionBlock(f*2,  f*2,  f*2)
         self.att1 = AttentionBlock(f,    f,    f)
 
-        # ── Decoder ──────────────────────────────
         self.up4 = nn.ConvTranspose2d(f*16, f*8, kernel_size=2, stride=2)
         self.dec4 = ConvBlock(f*16, f*8,  dropout_rate, batch_norm)
 
@@ -396,21 +354,17 @@ class AttentionUNet(nn.Module):
         self.up1 = nn.ConvTranspose2d(f*2, f,   kernel_size=2, stride=2)
         self.dec1 = ConvBlock(f*2,  f,    dropout_rate, batch_norm)
 
-        # ── Salida ───────────────────────────────
         self.output_conv = nn.Conv2d(f, num_classes, kernel_size=1)
         self.output_act  = nn.Sigmoid() if num_classes == 1 else nn.Softmax(dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder
         e1 = self.enc1(x)
         e2 = self.enc2(F.max_pool2d(e1, 2))
         e3 = self.enc3(F.max_pool2d(e2, 2))
         e4 = self.enc4(F.max_pool2d(e3, 2))
 
-        # Bottleneck
         b = self.bottleneck(F.max_pool2d(e4, 2))
 
-        # Decoder con attention gates
         g4  = self.gate4(b)
         a4  = self.att4(e4, g4)
         d4  = self.dec4(torch.cat([self.up4(b), a4], dim=1))

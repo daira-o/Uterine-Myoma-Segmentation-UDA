@@ -21,8 +21,6 @@ def _display_path(path: str) -> str:
         return os.path.basename(path)
  
  
-# ── Helpers ───────────────────────────────────────────────────────────────────
- 
 def _crop_fixed(img: np.ndarray,
                 top: float = 0.08,
                 bottom: float = 0.10,
@@ -63,7 +61,6 @@ def _inpaint_annotations(img: np.ndarray) -> np.ndarray:
     mask = (img >= 200).astype(np.uint8) * 255
  
     if mask.sum() > 0:
-        # Dilatar la máscara para cubrir halos de borde de las anotaciones
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.dilate(mask, k, iterations=1)
         img = cv2.inpaint(img, mask, inpaintRadius=6, flags=cv2.INPAINT_TELEA)
@@ -85,11 +82,9 @@ def _normalize(img: np.ndarray) -> np.ndarray:
       el rango dinámico con el fondo negro residual post-crop.
       np.clip satura cualquier resto de ruido blanco a 1.0.
     """
-    # CLAHE sobre imagen uint8
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img_clahe = clahe.apply(img)
  
-    # Percentiles solo sobre píxeles de tejido (excluir negro residual)
     tissue = img_clahe[img_clahe > 5].astype(np.float32)
     if tissue.size < 100:
         tissue = img_clahe.astype(np.float32).ravel()
@@ -102,8 +97,6 @@ def _normalize(img: np.ndarray) -> np.ndarray:
  
     return img_norm
  
- 
-# ── Procesador principal ──────────────────────────────────────────────────────
  
 def us_nosano_processor(base_path, output_path):
     """
@@ -138,7 +131,6 @@ def us_nosano_processor(base_path, output_path):
     out_img = os.path.join(output_path, "US_NO_SANO", "images_npy")
     os.makedirs(out_img, exist_ok=True)
  
-    # Recolectar imágenes (JPG y PNG, recursivo)
     extensions = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
     image_files = []
     for ext in extensions:
@@ -167,26 +159,16 @@ def us_nosano_processor(base_path, output_path):
             continue
  
         try:
-            # 1. Carga en escala de grises
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             if img is None:
                 print(f"\n  Advertencia: no se pudo leer '{img_path}'. Salteando...")
                 skipped += 1
                 continue
  
-            # 2. Crop asimétrico fijo
             img = _crop_fixed(img)
- 
-            # 3. Inpainting: umbral 200, dilatación 1px, radio 6
             img = _inpaint_annotations(img)
- 
-            # 4. CLAHE + normalización percentil 2–98 sobre tejido real
             img_norm = _normalize(img)
- 
-            # 5. Resize a 256 × 256
             img_res = cv2.resize(img_norm, (256, 256), interpolation=cv2.INTER_AREA)
- 
-            # 6. Guardar
             np.save(out_file, img_res.astype(np.float32))
             saved += 1
  
@@ -200,7 +182,6 @@ def us_nosano_processor(base_path, output_path):
     print(f"  Salteados : {skipped}")
     print(f"  Destino   : {_display_path(out_img)}")
  
-# ── CONFIGURACIÓN ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     us_nosano_processor(
         base_path=DEFAULT_US_DATA_PATH,

@@ -35,8 +35,6 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 
 
-# ── Configuración ─────────────────────────────────────────────────────────────
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(ENV_PATH)
@@ -51,7 +49,6 @@ US_OUTPUT_PATH = Path(
 IMAGE_SIZE = int(os.getenv("PROCESSOR_IMAGE_SIZE", "256"))
 TARGET_SPACING_MM = 0.8          # resolución objetivo: 1 px = 0.8 mm de tejido real
 
-# Mapa carpeta → profundidad en mm
 DEPTH_MAP: dict[str, float] = {
     "Escala_10cm": 100.0,
     "Escala_12cm": 120.0,
@@ -61,8 +58,6 @@ DEPTH_MAP: dict[str, float] = {
 
 US_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG")
 
-
-# ── Utilidades ────────────────────────────────────────────────────────────────
 
 def display_path(path: Path | str) -> str:
     """Ruta relativa al proyecto para logs sin exponer rutas locales."""
@@ -84,7 +79,6 @@ def pad_or_crop_center(img: np.ndarray, target_h: int, target_w: int) -> np.ndar
     h, w = img.shape
     out = np.zeros((target_h, target_w), dtype=img.dtype)
 
-    # Eje vertical
     if h <= target_h:
         pad_top = (target_h - h) // 2
         src_r0, src_r1 = 0, h
@@ -94,7 +88,6 @@ def pad_or_crop_center(img: np.ndarray, target_h: int, target_w: int) -> np.ndar
         src_r0, src_r1 = crop_top, crop_top + target_h
         dst_r0, dst_r1 = 0, target_h
 
-    # Eje horizontal
     if w <= target_w:
         pad_left = (target_w - w) // 2
         src_c0, src_c1 = 0, w
@@ -129,7 +122,7 @@ def physical_scale(img: np.ndarray, depth_mm: float) -> np.ndarray:
     """
     h_orig, w_orig = img.shape
 
-    spacing_actual_mm_px = depth_mm / h_orig           # resolución actual
+    spacing_actual_mm_px = depth_mm / h_orig
     factor_escala = spacing_actual_mm_px / TARGET_SPACING_MM
 
     new_h = max(1, round(h_orig * factor_escala))
@@ -137,7 +130,7 @@ def physical_scale(img: np.ndarray, depth_mm: float) -> np.ndarray:
 
     img_scaled = cv2.resize(
         img,
-        (new_w, new_h),          # cv2.resize: (width, height)
+        (new_w, new_h),
         interpolation=cv2.INTER_CUBIC,
     )
     return img_scaled
@@ -157,30 +150,23 @@ def preprocess_us_image(img_bgr: np.ndarray, depth_mm: float) -> np.ndarray:
     -------
     np.ndarray float32, shape (IMAGE_SIZE, IMAGE_SIZE), valores en [0, 1].
     """
-    # 1. Escala de grises
     if img_bgr.ndim == 3:
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     else:
         img = img_bgr.copy()
 
-    # 2. Volteo vertical (alineación con convención MRI)
+    # Alinea US con la orientacion usada en MRI.
     img = cv2.flip(img, 0)
 
-    # 3. Normalización Min-Max
     img = img.astype(np.float32)
     diff = img.max() - img.min()
     img = (img - img.min()) / (diff if diff != 0 else 1.0)
 
-    # 4. Resampling físico
     img = physical_scale(img, depth_mm)
-
-    # 5. Padding / Center Crop al tamaño fijo
     img = pad_or_crop_center(img, IMAGE_SIZE, IMAGE_SIZE)
 
     return img
 
-
-# ── Procesador principal ──────────────────────────────────────────────────────
 
 def normalizar_us(base_path: Path, output_path: Path) -> None:
     """
@@ -190,7 +176,6 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
 
     Reanudación automática: si el archivo .npy de destino ya existe, se omite.
     """
-    # ── Estadísticas globales
     total_saved = 0
     total_skipped = 0
     total_errors = 0
@@ -205,7 +190,6 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
 
         dst_folder.mkdir(parents=True, exist_ok=True)
 
-        # Recopilar imágenes de la carpeta (sin recursión: estructura plana por escala)
         image_files: list[Path] = []
         for ext in US_EXTENSIONS:
             image_files.extend(src_folder.glob(ext))
@@ -221,7 +205,6 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
             stem = img_path.stem
             out_file = dst_folder / f"{stem}.npy"
 
-            # Reanudación: saltar si ya fue procesada
             if out_file.exists():
                 skipped += 1
                 continue
@@ -256,8 +239,6 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
     print(f"  Destino   : {display_path(output_path)}")
     print("=" * 60)
 
-
-# ── Punto de entrada ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print(f"Fuente : {display_path(US_BASE_PATH)}")

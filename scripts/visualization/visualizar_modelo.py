@@ -1,30 +1,19 @@
 ﻿"""
-visualizar_modelo.py
-Dashboard interactivo para el modelo Attention U-Net de segmentacion de miomas.
-
-ESTRATEGIA DE ALTA FIDELIDAD:
-  El modelo opera sobre .npy de 256x256.
-  El visualizador recupera el NIfTI original (resolucion nativa) y proyecta
-  el contorno vectorial de la prediccion escalado sobre el.
-  Los contornos son poligonos vectoriales (marching squares), no pixeles.
-
-Requisitos:
-    pip install streamlit torch numpy matplotlib scipy scikit-image nibabel Pillow
-
-Uso:
-    streamlit run visualizar_modelo.py
+Dashboard Streamlit para inspeccionar predicciones de Attention U-Net.
 """
 
 import os
 import re
 import glob
 import warnings
+from pathlib import Path
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.path import Path
+from matplotlib.path import Path as MplPath
 from matplotlib.patches import PathPatch
 import streamlit as st
 import io
@@ -49,10 +38,6 @@ from models.attention_unet import AttentionUNet, compute_all_metrics
 TARGET_SPACING_MM = 0.8
 TILE_SIZE = 256
 
-
-# -----------------------------------------------------------------------------
-#  PAGINA
-# -----------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Visualizador de Miomas",
@@ -125,17 +110,9 @@ h1,h2,h3,h4 { font-family: 'Syne', sans-serif !important; }
 """, unsafe_allow_html=True)
 
 
-# -----------------------------------------------------------------------------
-#  COLORMAPS
-# -----------------------------------------------------------------------------
-
 CMAP_MRI = LinearSegmentedColormap.from_list(
     "mri", ["#020408", "#0a2540", "#1a4a7a", "#4a9aca", "#c8e8f8"], N=256)
 
-
-# -----------------------------------------------------------------------------
-#  HELPERS DE CARGA
-# -----------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner="Cargando modelo...")
 def load_model(model_path, device):
@@ -197,14 +174,7 @@ def load_npy(path):
 @st.cache_data(show_spinner=False)
 def load_hires_slice(nii_path: str, slice_idx: int):
     """
-    Carga el mismo corte del NIfTI que usa mri_pipeline.py.
-
-    El pipeline actual extrae eje 0:
-        img_slice = data_img[i, :, :]
-
-    Para superponer prediccion/GT sobre el NIfTI original, tambien devuelve
-    la transformacion inversa del tile 256x256 al corte original, deshaciendo
-    el resampling fisico y el center crop/padding.
+    Carga el corte nativo y la transformacion inversa desde el tile 256x256.
     """
     if not NIBABEL_OK:
         return None, "nibabel no instalado  ->  pip install nibabel"
@@ -234,7 +204,6 @@ def load_hires_slice(nii_path: str, slice_idx: int):
 
     slc = np.rot90(slc, k=1)
 
-    # -- Normalizar a [0,1] ------------------------------------------------
     d = slc.max() - slc.min()
     slc = (slc - slc.min()) / (d if d != 0 else 1.0)
 
@@ -246,10 +215,7 @@ def load_hires_slice(nii_path: str, slice_idx: int):
 
 
 def parse_npy_name(npy_path: str):
-    """
-    Extrae patient_id y slice_idx del nombre {patient_id}_sag_{idx}.npy
-    generado por procesador_imagenes.py.
-    """
+    """Lee patient_id y slice_idx desde {patient_id}_sag_{idx}.npy."""
     stem = os.path.splitext(os.path.basename(npy_path))[0]
     m = re.match(r"^(.+)_sag_(\d+)$", stem)
     return (m.group(1), int(m.group(2))) if m else (None, None)
@@ -278,10 +244,6 @@ def fig_to_bytes(fig):
 def make_fig(size=(5, 5)):
     return plt.subplots(figsize=size, facecolor="#080c10")
 
-
-# -----------------------------------------------------------------------------
-#  HELPERS DE RENDERIZADO VECTORIAL
-# -----------------------------------------------------------------------------
 
 def render_base(ax, img_hires, img_lores):
     """Dibuja la imagen base (hires si existe, lores como fallback)."""
@@ -330,12 +292,7 @@ def draw_contours(ax, prob_map, thr, display_shape,
                   fill_color, line_color, fill_alpha,
                   line_width=2.0, label="", transform=None):
     """
-    Proyecta la segmentacion del modelo (256x256) como contornos vectoriales
-    sobre una imagen de resolucion arbitraria (display_shape).
-
-    El escalado es proporcional: cada punto del contorno se multiplica por
-    (dst / src) en x e y. Como los contornos son poligonos (no pixeles),
-    la calidad es completamente independiente de la resolucion destino.
+    Proyecta contornos vectoriales del tile sobre la imagen que se muestra.
     """
     smooth   = gaussian_filter(prob_map.astype(float), sigma=1.5)
     contours = measure.find_contours(smooth, level=thr)
@@ -344,8 +301,8 @@ def draw_contours(ax, prob_map, thr, display_shape,
 
     for i, c in enumerate(contours):
         xy = tile_contour_to_display(c, prob_map.shape, display_shape, transform)
-        codes = [Path.MOVETO] + [Path.LINETO] * (len(xy) - 1) + [Path.CLOSEPOLY]
-        path  = Path(np.vstack([xy, xy[0]]), codes)
+        codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(xy) - 1) + [MplPath.CLOSEPOLY]
+        path  = MplPath(np.vstack([xy, xy[0]]), codes)
 
         ax.add_patch(PathPatch(path,
                                facecolor=fill_color, edgecolor="none",
@@ -374,18 +331,14 @@ def draw_error_contours(ax, prob_map, mask_np, thr, display_shape, transform=Non
         first = True
         for c in measure.find_contours(rs, level=0.5):
             xy = tile_contour_to_display(c, prob_map.shape, display_shape, transform)
-            codes = [Path.MOVETO] + [Path.LINETO] * (len(xy) - 1) + [Path.CLOSEPOLY]
-            path  = Path(np.vstack([xy, xy[0]]), codes)
+            codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(xy) - 1) + [MplPath.CLOSEPOLY]
+            path  = MplPath(np.vstack([xy, xy[0]]), codes)
             ax.add_patch(PathPatch(path, facecolor=fill, edgecolor="none",
                                    alpha=0.35, zorder=3))
             ax.plot(xy[:, 0], xy[:, 1], color=line, linewidth=1.8,
                     alpha=0.9, zorder=4, label=lbl if first else "")
             first = False
 
-
-# -----------------------------------------------------------------------------
-#  SIDEBAR
-# -----------------------------------------------------------------------------
 
 with st.sidebar:
     st.markdown('<div class="main-title" style="font-size:1.4rem">Visualizador de Miomas</div>',
@@ -441,20 +394,12 @@ with st.sidebar:
             'Ejecuta: pip install nibabel</div>', unsafe_allow_html=True)
 
 
-# -----------------------------------------------------------------------------
-#  HEADER
-# -----------------------------------------------------------------------------
-
 st.markdown('<h1 class="main-title">Visualizador de Miomas</h1>', unsafe_allow_html=True)
 st.markdown(
     '<p class="subtitle">Visualizador â€” Attention U-Net Â· Miomas Uterinos Â· RM Sagital</p>',
     unsafe_allow_html=True)
 st.markdown("")
 
-
-# -----------------------------------------------------------------------------
-#  VALIDACION DE RUTAS
-# -----------------------------------------------------------------------------
 
 if not os.path.exists(model_path):
     st.markdown(f'<div class="warn-box">No se encontro el checkpoint: {model_path}</div>',
@@ -478,44 +423,53 @@ st.markdown(
             unsafe_allow_html=True)
 
 
-# -----------------------------------------------------------------------------
-#  SELECTOR DE MUESTRA
-# -----------------------------------------------------------------------------
-
 col_sel1, col_sel2, col_sel3, col_r = st.columns([3, 1, 1, 1])
+sample_names = [sample_label(p, base_path) for p in all_imgs]
+
+if "sample_idx" not in st.session_state:
+    st.session_state["sample_idx"] = 0
+if st.session_state["sample_idx"] >= len(all_imgs):
+    st.session_state["sample_idx"] = 0
+
+
+def set_sample_idx(value: int) -> None:
+    st.session_state["sample_idx"] = max(0, min(value, len(all_imgs) - 1))
+
+
+def previous_sample() -> None:
+    set_sample_idx(int(st.session_state.get("sample_idx", 0)) - 1)
+
+
+def next_sample() -> None:
+    set_sample_idx(int(st.session_state.get("sample_idx", 0)) + 1)
+
+
+def random_sample() -> None:
+    set_sample_idx(int(np.random.randint(0, len(all_imgs))))
 
 with col_sel1:
-    sample_names  = [sample_label(p, base_path) for p in all_imgs]
-    selected_idx = st.selectbox(
+    st.selectbox(
         "Seleccionar imagen",
         range(len(sample_names)),
-        index=0,
+        index=int(st.session_state["sample_idx"]),
+        key="sample_idx",
         format_func=lambda i: sample_names[i],
     )
-    idx = int(selected_idx)
 
 with col_sel2:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("Anterior"):
-        st.session_state["idx"] = max(0, idx - 1)
+    st.button("Anterior", on_click=previous_sample)
 
 with col_sel3:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("Siguiente"):
-        st.session_state["idx"] = min(len(all_imgs) - 1, idx + 1)
+    st.button("Siguiente", on_click=next_sample)
 
 with col_r:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("Aleatoria"):
-        st.session_state["idx"] = int(np.random.randint(0, len(all_imgs)))
+    st.button("Aleatoria", on_click=random_sample)
 
-if "idx" in st.session_state:
-    idx = st.session_state["idx"]
+idx = int(st.session_state["sample_idx"])
 
-
-# -----------------------------------------------------------------------------
-#  INFERENCIA
-# -----------------------------------------------------------------------------
 
 img_path = all_imgs[idx]
 mask_path = all_masks[idx] if idx < len(all_masks) else None
@@ -525,10 +479,6 @@ mask_npy = load_npy(mask_path) if mask_path else np.zeros_like(img_npy)
 with st.spinner("Generando prediccion..."):
     prob_map, pred_bin = predict(model, img_npy, device, threshold)
 
-
-# -----------------------------------------------------------------------------
-#  RECUPERAR NIFTI ORIGINAL
-# -----------------------------------------------------------------------------
 
 patient_id, slice_idx = parse_npy_name(img_path)
 img_hires    = None
@@ -552,7 +502,6 @@ elif not NIBABEL_OK:
 elif patient_id is None:
     hires_status = "nombre .npy no coincide con patron patient_id_sag_N"
 
-# Forma efectiva para escalar los contornos
 display_shape = img_hires.shape if img_hires is not None else img_npy.shape
 
 if img_hires is not None:
@@ -564,10 +513,6 @@ else:
 
 st.markdown(f"Resolucion de visualizacion: {badge}", unsafe_allow_html=True)
 
-
-# -----------------------------------------------------------------------------
-#  METRICAS
-# -----------------------------------------------------------------------------
 
 st.markdown("---")
 st.markdown('<div class="section-header">Metricas de esta muestra</div>',
@@ -607,10 +552,6 @@ metric_card(mc4, f"{n_pred} / {n_gt}", "Objetos Pred / GT", "Miomas detectados v
             color="var(--accent)" if n_pred == n_gt else "var(--accent2)")
 
 
-# -----------------------------------------------------------------------------
-#  VISUALIZACIONES
-# -----------------------------------------------------------------------------
-
 st.markdown("---")
 st.markdown('<div class="section-header">Visualizacion</div>', unsafe_allow_html=True)
 
@@ -618,7 +559,6 @@ n_panels = 2 + int(show_prob_map) + int(show_diff_map)
 cols     = st.columns(n_panels)
 
 
-# ---- Panel 1: imagen base ---------------------------------------------------
 with cols[0]:
     titulo = ("MRI original (NIfTI nativo)" if img_hires is not None
               else "MRI procesado (.npy 256x256)")
@@ -632,7 +572,6 @@ with cols[0]:
     plt.close(fig)
 
 
-# ---- Panel 2: overlay con contornos escalados -------------------------------
 with cols[1]:
     lbl2 = "Pred (teal) + GT (rosa)" if show_gt else "Prediccion del modelo"
     st.markdown(f'<div class="section-header" style="text-align:center">{lbl2}</div>',
@@ -661,7 +600,6 @@ with cols[1]:
     plt.close(fig)
 
 
-# ---- Panel 3: mapa de probabilidades ----------------------------------------
 panel_idx = 2
 if show_prob_map and panel_idx < len(cols):
     with cols[panel_idx]:
@@ -679,7 +617,6 @@ if show_prob_map and panel_idx < len(cols):
             cbar = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
             cbar.ax.yaxis.set_tick_params(color="#4a6070", labelsize=5, labelcolor="#4a6070")
 
-        # Contorno del umbral vectorial escalado
         smooth = gaussian_filter(prob_map.astype(float), sigma=1.5)
         for c in measure.find_contours(smooth, level=threshold):
             xy = tile_contour_to_display(c, prob_map.shape, display_shape, hires_transform)
@@ -693,7 +630,6 @@ if show_prob_map and panel_idx < len(cols):
     panel_idx += 1
 
 
-# ---- Panel 4: error map vectorial -------------------------------------------
 if show_diff_map and panel_idx < len(cols):
     with cols[panel_idx]:
         st.markdown(
@@ -719,10 +655,6 @@ if show_diff_map and panel_idx < len(cols):
         plt.close(fig)
 
 
-# -----------------------------------------------------------------------------
-#  HISTOGRAMA
-# -----------------------------------------------------------------------------
-
 st.markdown("---")
 with st.expander("Distribucion de probabilidades predichas", expanded=False):
     fig, ax = plt.subplots(figsize=(10, 2.8), facecolor="#080c10")
@@ -746,10 +678,6 @@ with st.expander("Distribucion de probabilidades predichas", expanded=False):
     st.pyplot(fig, use_container_width=False)
     plt.close(fig)
 
-
-# -----------------------------------------------------------------------------
-#  EVALUACION DE BATCH
-# -----------------------------------------------------------------------------
 
 st.markdown("---")
 with st.expander("Evaluar batch aleatorio (N muestras)", expanded=False):
@@ -813,10 +741,6 @@ with st.expander("Evaluar batch aleatorio (N muestras)", expanded=False):
         st.pyplot(fig, use_container_width=False)
         plt.close(fig)
 
-
-# -----------------------------------------------------------------------------
-#  FOOTER
-# -----------------------------------------------------------------------------
 
 st.markdown("---")
 st.markdown(
