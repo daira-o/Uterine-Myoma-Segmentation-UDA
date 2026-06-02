@@ -20,6 +20,13 @@ data_ready_US/
 outputs/weights/
 outputs/
 
+# Experimentos y artefactos generados
+logs/
+checkpoints/
+debug/
+debug.zip
+*.zip
+
 # Configuración personal
 .env
 .vscode/

@@ -1,73 +1,149 @@
-# Segmentación de Miomas Uterinos
+# Segmentacion de Miomas Uterinos con Adaptacion de Dominio
 
-Attention U-Net para segmentación de miomas en RM sagital T2.
+Proyecto para segmentar miomas uterinos combinando RM sagital T2 como dominio fuente y ultrasonido como dominio objetivo. El flujo actual cubre preparacion de datos, entrenamiento source, adaptacion target con DANN/supervision debil, evaluacion de checkpoints, inferencia y visualizacion.
 
 ## Estructura
 
-```
-proyecto/
-├── .env                        ← rutas locales (NO subir a git)
-├── .gitignore
-├── config.py                   ← configuración central (lee .env)
-├── models/
-│   └── attention_unet.py       ← arquitectura + métricas
-├── scripts/
-│   ├── data_preparation/       ← pipelines MRI/US, curación y splits
-│   ├── training/               ← entrenamientos source, target y baselines
-│   ├── inference/              ← inferencia de producción
-│   ├── evaluation/             ← revisión de dataset y comparación de modelos
-│   ├── visualization/          ← dashboards y visualizadores
-│   └── utils/                  ← utilidades operativas pequeñas
-└── logs/
-    └── training_metrics.csv    ← métricas por época (auto-generado)
+```text
+Uterine-Myoma-Segmentation-UDA/
++-- config.py
++-- models/
+|   +-- attention_unet.py
+|   +-- attention_unet_dann.py
+|   +-- dann_unet.py
+|   +-- domain_discriminator.py
+|   +-- grl.py
++-- scripts/
+|   +-- data_preparation/
+|   +-- training/
+|   +-- inference/
+|   +-- evaluation/
+|   +-- visualization/
+|   +-- utils/
++-- docs/
+|   +-- dann_implementation.md
++-- logs/
++-- requirements.txt
 ```
 
-## Setup
+## Configuracion
+
+Instalar dependencias:
 
 ```bash
-pip install torch numpy scikit-learn scipy scikit-image nibabel \
-            streamlit matplotlib python-dotenv Pillow opencv-python
+pip install -r requirements.txt
 ```
 
-Crear el archivo `.env` en la raíz del proyecto:
-```
-DATA_PATH=C:/ruta/a/data_ready_RM
-NIFTI_ROOT=C:/ruta/a/data/UMD
+Crear un `.env` en la raiz del proyecto. Las rutas pueden ser absolutas o relativas al repo.
+
+```env
+DATA_PATH=data_ready_RM
+MRI_DATA_PATH=data/UMD
+MRI_OUTPUT_PATH=data_ready_RM
+NIFTI_ROOT=data/UMD
 NIFTI_IMG_SUFFIX=_t2
-US_DATA_PATH=C:/ruta/a/data/Ultrasound
-US_OUTPUT_PATH=C:/ruta/a/data_ready_US
+NIFTI_MASK_SUFFIX=_seg
+
+US_DATA_PATH=data/Ultrasound
+US_OUTPUT_PATH=data_ready_US
+US_READY_PATH=data_ready_US
+
 MODEL_PATH=best_model_sagital.pth
 LOGS_PATH=logs
+OUTPUTS_PATH=outputs
+
+BATCH_SIZE=8
+EPOCHS=30
+LR=1e-4
+USE_DANN=0
+LAMBDA_DOMAIN=0.0
+
+WEAK_LOSS_TYPE=soft_bbox
+WEAK_BBOX_MARGIN_PX=4
+WEAK_OUTSIDE_WEIGHT=1.0
+WEAK_INSIDE_WEIGHT=2.0
+WEAK_AREA_WEIGHT=0.10
+US_METRIC_THRESHOLDS=0.30,0.35,0.40,0.50
 ```
 
-## Uso
+## Flujo Principal
+
+Preparar RM desde NIfTI a `.npy`:
 
 ```bash
-# 1. Procesar NIfTI originales a .npy
 python scripts/data_preparation/mri_pipeline.py
-
-# 2. Entrenar
-python scripts/training/train_source.py
-
-# 3. Visualizar
-streamlit run scripts/visualization/visualizar_modelo.py
-
-# Visualizar ultrasonido procesado
-python scripts/visualization/visualizador_us.py
 ```
 
-## Métricas guardadas
+Preparar ultrasonido y anotaciones:
 
-Cada run de entrenamiento agrega filas al archivo `logs/training_metrics.csv`:
+```bash
+python scripts/data_preparation/us_pipeline.py
+python scripts/data_preparation/organize_us_annotations.py --dry-run
+python scripts/data_preparation/organize_us_annotations.py
+python scripts/data_preparation/build_us_splits_from_clean.py
+```
 
-| columna | descripción |
-|---|---|
-| run_id | timestamp del run (YYYYMMDD_HHMMSS) |
-| epoch | número de época |
-| avg_loss | pérdida promedio de entrenamiento |
-| dice | Dice coefficient en validación |
-| hd95 | Hausdorff 95% en píxeles |
-| obj_precision | precisión a nivel de instancia |
-| hd95_inf_batches | batches con predicción vacía |
-| is_best | 1 si fue el mejor Dice hasta ese momento |
-| timestamp | fecha y hora exacta |
+Entrenar el modelo source sobre RM:
+
+```bash
+python scripts/training/train_source.py
+```
+
+Adaptar a US con entrenamiento target:
+
+```bash
+python scripts/training/train_target.py
+```
+
+Comparar checkpoints sobre US:
+
+```bash
+python scripts/evaluation/compare_checkpoints_us.py --help
+```
+
+Ejecutar inferencia de produccion:
+
+```bash
+python scripts/inference/infer_us_production.py --help
+```
+
+## Visualizacion
+
+Dashboard para RM:
+
+```bash
+streamlit run scripts/visualization/visualizar_modelo.py
+```
+
+Dashboard para US:
+
+```bash
+streamlit run scripts/visualization/visualizar_us_modelo.py
+```
+
+Visualizadores rapidos con Matplotlib:
+
+```bash
+python scripts/visualization/visualizador_mri.py
+python scripts/visualization/visualizador_us.py
+python scripts/visualization/visualizar_epocas_target.py
+```
+
+## Modelos
+
+- `AttentionUNet`: arquitectura base para segmentacion binaria.
+- `DANNUNet` / `AttentionUNetDANN`: variantes con adaptacion de dominio.
+- `GradientReversalLayer`: invierte gradientes para entrenamiento adversarial.
+- `DomainDiscriminator`: predice dominio MRI/US desde features del encoder.
+
+## Metricas y Logs
+
+Los entrenamientos escriben metricas y checkpoints en `logs/`. Las metricas principales son:
+
+- Dice coefficient.
+- HD95.
+- Object Precision.
+- Perdidas de segmentacion, dominio y supervision debil.
+- Metricas US por umbral cuando corresponde.
+
+Los artefactos generados en `logs/`, `outputs/`, checkpoints y previews de debug no deberian versionarse salvo que se necesiten para una entrega especifica.
