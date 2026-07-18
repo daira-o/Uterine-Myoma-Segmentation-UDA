@@ -19,6 +19,7 @@ data_ready_US/
 *.pt
 outputs/weights/
 outputs/
+hf_model/
 
 # Experimentos y artefactos generados
 logs/

@@ -1,38 +1,34 @@
 """
-normalizar_us_08mm.py
-=====================
-Normaliza el dataset de Ultrasonido a resolución física 0.8 mm/px para que sea
-comparable con el MRI procesado previamente.
+Normalize ultrasound images to 0.8 mm/px.
 
-Para cada imagen:
-  1. Determina la profundidad real (mm) según la carpeta de origen.
-  2. Calcula la resolución actual: spacing_actual = D_mm / altura_px
-  3. Calcula el factor de escala:  factor = spacing_actual / 0.8
-  4. Redimensiona con INTER_CUBIC preservando relación de aspecto.
-  5. Aplica Center Padding (negro) o Center Crop para llegar a IMAGE_SIZE × IMAGE_SIZE.
+This legacy utility makes ultrasound images physically comparable with the
+previously processed MRI slices.
 
-Estructura de entrada esperada:
+For each image:
+  1. Infer the real field depth in millimeters from the source folder.
+  2. Compute current spacing: current_spacing = depth_mm / image_height_px.
+  3. Compute scale factor: scale = current_spacing / 0.8.
+  4. Resize with INTER_CUBIC while preserving aspect ratio.
+  5. Center pad or center crop to IMAGE_SIZE x IMAGE_SIZE.
+
+Expected input structure:
   US_BASE_PATH/
-    Escala_10cm/   ← profundidad 100 mm
-    Escala_12cm/   ← profundidad 120 mm
-    Escala_15cm/   ← profundidad 150 mm
-    Escala_16cm/   ← profundidad 160 mm
+    Escala_10cm/   depth 100 mm
+    Escala_12cm/   depth 120 mm
+    Escala_15cm/   depth 150 mm
+    Escala_16cm/   depth 160 mm
 
-Estructura de salida generada (espejo):
-  US_OUTPUT_PATH/
-    Escala_10cm/
-    Escala_12cm/
-    Escala_15cm/
-    Escala_16cm/
+Generated output mirrors the same folder structure under US_OUTPUT_PATH.
 """
 
 import os
-import cv2
-import numpy as np
 from glob import glob
 from pathlib import Path
-from tqdm import tqdm
+
+import cv2
+import numpy as np
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +43,7 @@ US_OUTPUT_PATH = Path(
 )
 
 IMAGE_SIZE = int(os.getenv("PROCESSOR_IMAGE_SIZE", "256"))
-TARGET_SPACING_MM = 0.8          # resolución objetivo: 1 px = 0.8 mm de tejido real
+TARGET_SPACING_MM = 0.8  # Target resolution: 1 px = 0.8 mm of real tissue.
 
 DEPTH_MAP: dict[str, float] = {
     "Escala_10cm": 100.0,
@@ -60,7 +56,7 @@ US_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG")
 
 
 def display_path(path: Path | str) -> str:
-    """Ruta relativa al proyecto para logs sin exponer rutas locales."""
+    """Return a project-relative path for logs without exposing local roots."""
     try:
         return os.path.relpath(path, PROJECT_ROOT)
     except ValueError:
@@ -69,12 +65,11 @@ def display_path(path: Path | str) -> str:
 
 def pad_or_crop_center(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     """
-    Ajusta un array 2-D a (target_h, target_w) sin redimensionar el contenido.
+    Fit a 2-D array to `(target_h, target_w)` without scaling content.
 
-    - Si la imagen es más pequeña → padding de ceros centrado (negro).
-    - Si la imagen es más grande  → center crop desde el centro.
-
-    Garantiza que 1 px sigue valiendo TARGET_SPACING_MM mm tras la operación.
+    Smaller images are centered with zero padding. Larger images are center
+    cropped. Because this step does not rescale the image, the physical
+    resolution remains TARGET_SPACING_MM mm/px.
     """
     h, w = img.shape
     out = np.zeros((target_h, target_w), dtype=img.dtype)
@@ -103,22 +98,14 @@ def pad_or_crop_center(img: np.ndarray, target_h: int, target_w: int) -> np.ndar
 
 def physical_scale(img: np.ndarray, depth_mm: float) -> np.ndarray:
     """
-    Escala la imagen a TARGET_SPACING_MM mm/px a partir de su profundidad real.
+    Scale an ultrasound image to TARGET_SPACING_MM mm/px.
 
-    Parámetros
-    ----------
-    img      : array 2-D (grayscale, float32 en [0, 1]).
-    depth_mm : profundidad total del campo ecográfico en mm (eje vertical).
+    The vertical field depth gives the original physical spacing:
+        current_spacing = depth_mm / img.shape[0]
+        scale_factor = current_spacing / TARGET_SPACING_MM
 
-    Proceso
-    -------
-    spacing_actual = depth_mm / img.shape[0]   # mm por píxel original
-    factor_escala  = spacing_actual / TARGET_SPACING_MM
-    new_h = round(img.shape[0] * factor_escala)
-    new_w = round(img.shape[1] * factor_escala)
-
-    El mismo factor se aplica a ambas dimensiones para no distorsionar la
-    relación de aspecto (el ecógrafo preserva píxeles cuadrados en la imagen).
+    The same factor is applied to height and width to avoid aspect-ratio
+    distortion.
     """
     h_orig, w_orig = img.shape
 
@@ -138,24 +125,21 @@ def physical_scale(img: np.ndarray, depth_mm: float) -> np.ndarray:
 
 def preprocess_us_image(img_bgr: np.ndarray, depth_mm: float) -> np.ndarray:
     """
-    Pipeline completo para una imagen de US:
+    Run the complete preprocessing path for one ultrasound image.
 
-    1. Convertir a escala de grises.
-    2. Volteo vertical (transductor arriba → transductor abajo, estilo MRI).
-    3. Normalización Min-Max → float32 en [0, 1].
-    4. Resampling físico a TARGET_SPACING_MM mm/px (INTER_CUBIC).
-    5. Padding / Center Crop → IMAGE_SIZE × IMAGE_SIZE.
-
-    Returns
-    -------
-    np.ndarray float32, shape (IMAGE_SIZE, IMAGE_SIZE), valores en [0, 1].
+    Steps:
+        1. Convert to grayscale.
+        2. Flip vertically to align ultrasound orientation with MRI convention.
+        3. Min-max normalize to float32 in [0, 1].
+        4. Resample physically to TARGET_SPACING_MM mm/px.
+        5. Center pad or crop to IMAGE_SIZE x IMAGE_SIZE.
     """
     if img_bgr.ndim == 3:
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     else:
         img = img_bgr.copy()
 
-    # Alinea US con la orientacion usada en MRI.
+    # Align ultrasound orientation with the convention used by the MRI pipeline.
     img = cv2.flip(img, 0)
 
     img = img.astype(np.float32)
@@ -170,11 +154,10 @@ def preprocess_us_image(img_bgr: np.ndarray, depth_mm: float) -> np.ndarray:
 
 def normalizar_us(base_path: Path, output_path: Path) -> None:
     """
-    Recorre las subcarpetas de `base_path` definidas en DEPTH_MAP,
-    procesa cada imagen y guarda el resultado como .npy en la estructura
-    espejo dentro de `output_path`.
+    Process folders listed in DEPTH_MAP and save `.npy` images.
 
-    Reanudación automática: si el archivo .npy de destino ya existe, se omite.
+    Resume behavior: if the destination `.npy` already exists, the image is
+    skipped instead of recomputed.
     """
     total_saved = 0
     total_skipped = 0
@@ -185,7 +168,7 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
         dst_folder = output_path / folder_name
 
         if not src_folder.exists():
-            print(f"[AVISO] Carpeta no encontrada, omitiendo: {display_path(src_folder)}")
+            print(f"[WARN] Folder not found, skipping: {display_path(src_folder)}")
             continue
 
         dst_folder.mkdir(parents=True, exist_ok=True)
@@ -196,7 +179,7 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
         image_files = sorted(set(image_files))
 
         if not image_files:
-            print(f"[AVISO] Sin imágenes en {display_path(src_folder)}")
+            print(f"[WARN] No images found in {display_path(src_folder)}")
             continue
 
         saved = skipped = errors = 0
@@ -211,7 +194,7 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
 
             img_bgr = cv2.imread(str(img_path))
             if img_bgr is None:
-                print(f"\n  [ERROR] No se pudo leer: {display_path(img_path)}")
+                print(f"\n  [ERROR] Could not read: {display_path(img_path)}")
                 errors += 1
                 continue
 
@@ -224,25 +207,25 @@ def normalizar_us(base_path: Path, output_path: Path) -> None:
                 errors += 1
 
         print(
-            f"  → Guardadas: {saved:4d} | Saltadas: {skipped:4d} | Errores: {errors:2d}"
+            f"  -> Saved: {saved:4d} | Skipped: {skipped:4d} | Errors: {errors:2d}"
             f"  ({display_path(dst_folder)})"
         )
-        total_saved  += saved
+        total_saved += saved
         total_skipped += skipped
-        total_errors  += errors
+        total_errors += errors
 
     print("\n" + "=" * 60)
-    print("RESUMEN FINAL")
-    print(f"  Guardadas : {total_saved}")
-    print(f"  Saltadas  : {total_skipped}")
-    print(f"  Errores   : {total_errors}")
-    print(f"  Destino   : {display_path(output_path)}")
+    print("FINAL SUMMARY")
+    print(f"  Saved   : {total_saved}")
+    print(f"  Skipped : {total_skipped}")
+    print(f"  Errors  : {total_errors}")
+    print(f"  Output  : {display_path(output_path)}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    print(f"Fuente : {display_path(US_BASE_PATH)}")
-    print(f"Destino: {display_path(US_OUTPUT_PATH)}")
-    print(f"Target : {TARGET_SPACING_MM} mm/px  →  {IMAGE_SIZE}×{IMAGE_SIZE} px\n")
+    print(f"Source : {display_path(US_BASE_PATH)}")
+    print(f"Output : {display_path(US_OUTPUT_PATH)}")
+    print(f"Target : {TARGET_SPACING_MM} mm/px  ->  {IMAGE_SIZE}x{IMAGE_SIZE} px\n")
 
     normalizar_us(US_BASE_PATH, US_OUTPUT_PATH)

@@ -1,11 +1,10 @@
 """
-dann_unet.py
-Integracion DANN sobre la Attention U-Net existente.
+DANN wrapper around the existing Attention U-Net segmenter.
 
-Fase 2:
-    imagen -> AttentionUNet.encode() -> bottleneck features
-        -> AttentionUNet.decode() -> segmentation logits
-        -> GRL -> DomainDiscriminator -> domain logits
+Phase 2 flow:
+    image -> AttentionUNetDANN.encode() -> bottleneck features
+          -> AttentionUNetDANN.decode() -> segmentation logits
+          -> GRL -> DomainDiscriminator -> domain logits
 """
 
 from __future__ import annotations
@@ -29,20 +28,21 @@ FeatureMode = Literal["bottleneck", "multiscale"]
 
 class DANNUNet(nn.Module):
     """
-    Attention U-Net + Gradient Reversal Layer + Domain Discriminator.
+    Attention U-Net plus Gradient Reversal Layer and Domain Discriminator.
 
     Args:
-        in_channels: canales de entrada de la U-Net.
-        num_classes: canales de salida de segmentacion.
-        base_filters: filtros base de la Attention U-Net.
-        discriminator_hidden_dim: dimension oculta del discriminator.
-        discriminator_dropout: dropout del discriminator.
-        feature_mode: "bottleneck" recomendado; "multiscale" usa enc3/enc4/bottleneck.
+        in_channels: Number of U-Net input channels.
+        num_classes: Number of segmentation output channels.
+        base_filters: Base channel count in the Attention U-Net.
+        discriminator_hidden_dim: Hidden size in the domain discriminator.
+        discriminator_dropout: Dropout in the domain discriminator.
+        feature_mode: "bottleneck" is recommended; "multiscale" uses
+            enc3, enc4, and bottleneck features.
 
     Forward:
         seg_logits, domain_logits = model(x, alpha=alpha)
 
-    Para target/US sin mascara:
+    For target/US batches without masks:
         _, domain_logits = model(x_us, alpha=alpha, return_segmentation=False)
     """
 
@@ -81,14 +81,14 @@ class DANNUNet(nn.Module):
                 dropout_rate=discriminator_dropout,
             )
         else:
-            raise ValueError(f"feature_mode no soportado: {feature_mode}")
+            raise ValueError(f"Unsupported feature_mode: {feature_mode}")
 
     def _domain_logits(
         self,
         features: dict[str, torch.Tensor],
         alpha: float,
     ) -> torch.Tensor:
-        """Aplica GRL a features profundas y predice dominio."""
+        """Apply GRL to deep features and predict the input domain."""
         self.grl.set_lambda(alpha)
         if self.feature_mode == "bottleneck":
             reversed_features = self.grl(features["bottleneck"])
@@ -108,10 +108,11 @@ class DANNUNet(nn.Module):
         return_segmentation: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """
-        Devuelve logits de segmentacion y logits de dominio.
+        Return segmentation logits and domain logits.
 
-        Si return_segmentation=False se evita ejecutar el decoder, util para US.
-        El encoder siempre recibe gradientes adversariales a traves del GRL.
+        When `return_segmentation=False`, the decoder is skipped. This is useful
+        for ultrasound batches used only for domain supervision. The encoder
+        still receives adversarial gradients through the GRL.
         """
         features = self.segmenter.encode(x)
         seg_logits = self.segmenter.decode(features) if return_segmentation else None
@@ -125,10 +126,10 @@ class DANNUNet(nn.Module):
         strict: bool = True,
     ) -> tuple[list[str], list[str]]:
         """
-        Carga pesos de Fase 1 dentro de self.segmenter.
+        Load phase-1 segmenter weights into `self.segmenter`.
 
-        Acepta checkpoints guardados como state_dict puro o como dict con claves
-        comunes: model_state_dict, state_dict, segmenter_state_dict.
+        Supports plain state_dict checkpoints and dictionaries with common keys:
+        `model_state_dict`, `state_dict`, or `segmenter_state_dict`.
         """
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
         if isinstance(checkpoint, dict):

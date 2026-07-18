@@ -1,7 +1,7 @@
-"""Postprocessing robusto para mascaras US.
+"""Robust postprocessing for ultrasound masks.
 
-El bbox se usa solo como guia anatomica: nunca se aplica como mascara dura ni
-se recorta la prediccion al rectangulo.
+The bounding box is used only as anatomical guidance. It is never applied as a
+hard mask, and the prediction is never cropped to the rectangle.
 """
 
 from __future__ import annotations
@@ -324,8 +324,8 @@ def postprocess_prediction(
     )
     components_after_small = component_infos(after_small, boxes, expanded_boxes)
     if boxes and not components_after_small and components_before:
-        # Si min_area_px fue demasiado agresivo, se permite elegir desde la
-        # mascara original usando la bbox como guia, no el area como criterio.
+        # If min_area_px was too aggressive, select from the original mask using
+        # bbox guidance rather than area as the criterion.
         selection_mask = mask_before
         selection_components = components_before
     else:

@@ -241,7 +241,7 @@ def organize_annotations(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Mueve/copia XML de US junto a su imagen correspondiente por nombre base."
+        description="Move/copy US XML annotations next to the matching image by base filename."
     )
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument(
@@ -262,16 +262,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     summary = organize_annotations(parse_args())
-    print("Resumen de alineacion XML/imagenes")
+    print("XML/image alignment summary")
     print(f"Dataset              : {summary['dataset_root']}")
     print(f"Dry run              : {summary['dry_run']}")
-    print(f"Total imagenes       : {summary['total_images']}")
+    print(f"Total images         : {summary['total_images']}")
     print(f"XML encontrados      : {summary['total_xml_found']}")
     print(f"XML validos          : {summary['total_valid_xml']}")
     print(f"XML validos unicos   : {summary['total_unique_valid_xml']}")
-    print(f"Imagenes sin XML     : {summary['images_without_annotation']}")
+    print(f"Images without XML   : {summary['images_without_annotation']}")
     print(f"XML no utilizados    : {summary['unused_annotations']}")
-    print("Por carpeta/FOV:")
+    print("By folder/FOV:")
     for folder, stats in summary["per_folder"].items():
         print(
             f"  {folder:18s} images={stats['images']:4d} "

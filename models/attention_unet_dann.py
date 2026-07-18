@@ -1,10 +1,10 @@
 """
-attention_unet_dann.py
-Extension minima de AttentionUNet para exponer encoder/bottleneck/decoder en DANN.
+Minimal Attention U-Net extension for DANN.
 
-La arquitectura base sigue viviendo en models/attention_unet.py. Esta clase hereda
-sus modulos sin duplicarlos, por lo que los checkpoints de Fase 1 mantienen los
-mismos nombres de parametros.
+The base architecture remains in `models/attention_unet.py`. This subclass
+reuses the same modules and parameter names, so phase-1 checkpoints remain
+compatible while encoder, bottleneck, and decoder features can be exposed for
+domain adaptation.
 """
 
 from __future__ import annotations
@@ -16,14 +16,13 @@ from models.attention_unet import AttentionUNet
 
 
 class AttentionUNetDANN(AttentionUNet):
-    """Attention U-Net compatible con DANN sin modificar la clase original."""
+    """DANN-compatible Attention U-Net without modifying the base class."""
 
     def encode(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Ejecuta encoder + bottleneck y expone features profundas para DANN.
+        Run the encoder and bottleneck, returning features for DANN.
 
-        Los nombres de modulos son los mismos que en AttentionUNet:
-        enc1/enc2/enc3/enc4/bottleneck.
+        Module names match `AttentionUNet`: enc1, enc2, enc3, enc4, bottleneck.
         """
         e1 = self.enc1(x)
         e2 = self.enc2(F.max_pool2d(e1, 2))
@@ -33,7 +32,7 @@ class AttentionUNetDANN(AttentionUNet):
         return {"enc1": e1, "enc2": e2, "enc3": e3, "enc4": e4, "bottleneck": b}
 
     def decode(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Ejecuta el decoder de segmentacion a partir de features del encoder."""
+        """Run the segmentation decoder from previously computed features."""
         e1 = features["enc1"]
         e2 = features["enc2"]
         e3 = features["enc3"]
@@ -59,7 +58,7 @@ class AttentionUNetDANN(AttentionUNet):
         return self.output_conv(d1)
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Devuelve las features del bottleneck para adaptacion de dominio."""
+        """Return bottleneck features for domain adaptation."""
         return self.encode(x)["bottleneck"]
 
     def forward(

@@ -23,7 +23,7 @@ python scripts/data_preparation/build_us_splits_from_clean.py --help
 ## Entrenamiento
 
 - `training/train_source.py`: entrena Attention U-Net sobre RM.
-- `training/train_target.py`: adapta el modelo a US con DANN y/o supervision debil.
+- `training/train_target.py`: ajusta el modelo a US con supervision debil; opcionalmente permite DANN si se activa en la configuracion.
 
 ```bash
 python scripts/training/train_source.py
@@ -53,7 +53,7 @@ python scripts/evaluation/review_us_dataset.py --help
 ## Visualizacion
 
 - `visualization/visualizar_modelo.py`: dashboard Streamlit para RM/modelo source.
-- `visualization/visualizar_us_modelo.py`: dashboard Streamlit para US/adaptacion target.
+- `visualization/visualizar_us_modelo.py`: dashboard Streamlit para inferencia y revision del modelo ajustado a US.
 - `visualization/visualizador_mri.py`: comparacion rapida entre NIfTI original y tile procesado.
 - `visualization/visualizador_us.py`: inspeccion rapida de US procesado.
 - `visualization/visualizar_epocas_target.py`: revisa la evolucion visual del entrenamiento target.
@@ -72,4 +72,3 @@ python scripts/visualization/visualizador_us.py
 ```bash
 python scripts/utils/chequear_gpu.py
 ```
-

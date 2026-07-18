@@ -1,12 +1,10 @@
 """
-us_pipeline.py
-==============
-Pipeline de preparacion de datos del dominio destino para entrenamiento DANN.
+Ultrasound preprocessing pipeline for the target domain.
 
-Procesa imagenes de ultrasonido (.png / .jpg) organizadas por campo visual
-(FOV) y las transforma en arrays .npy normalizados, isometricos (0.8 mm/px)
-y de tamano fijo (256x256), compatibles con el dominio MRI generado por
-mri_pipeline.py.
+This script processes ultrasound images organized by field of view (FOV) and
+exports normalized, physically resampled `.npy` arrays at 0.8 mm/px with fixed
+256 x 256 spatial size. The output is compatible with the MRI domain generated
+by `mri_pipeline.py`.
 """
 
 from __future__ import annotations
@@ -64,7 +62,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class BBox:
-    """Caja Pascal VOC en coordenadas xyxy."""
+    """Pascal VOC bounding box in xyxy coordinates."""
 
     xmin: float
     ymin: float
@@ -101,7 +99,7 @@ class ProcessedUSSample:
 
 
 class PascalVOCReader:
-    """Lee bounding boxes desde XML Pascal VOC asociado al nombre de la imagen."""
+    """Read Pascal VOC bounding boxes from the XML file next to an image."""
 
     @staticmethod
     def xml_path_for_image(img_path: str) -> Optional[Path]:
@@ -142,7 +140,7 @@ class PascalVOCReader:
 
 
 class BBoxTransformer:
-    """Aplica a bboxes la misma geometria usada por el pipeline visual."""
+    """Apply the same geometric transforms to bounding boxes and images."""
 
     @staticmethod
     def crop(boxes: list[BBox], x: int, y: int, width: int, height: int) -> list[BBox]:
@@ -211,20 +209,23 @@ class BBoxTransformer:
 
 
 class ImageLoader:
-    """Responsabilidad unica: cargar una imagen desde disco en formato BGR."""
+    """Load an image from disk in BGR format."""
 
     @staticmethod
     def load(path: str) -> Optional[np.ndarray]:
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
-            log.warning("No se pudo cargar: %s", path)
+            log.warning("Could not load: %s", path)
         return img
 
 
 class CalibrationMarksRemover:
     """
-    Detecta y elimina textos perifericos, marcas de la interfaz y las cruces de
-    medicion (calibradores) usando operadores morfologicos dirigidos.
+    Remove peripheral text, interface marks, and measurement calipers.
+
+    The masks are intentionally conservative and use targeted morphology before
+    inpainting, so anatomical content in the acoustic cone is disturbed as little
+    as possible.
     """
 
     def __init__(self, inpaint_radius: int = INPAINT_RADIUS) -> None:
@@ -278,8 +279,10 @@ class CalibrationMarksRemover:
 
 class ROICropper:
     """
-    Aisla el cono acustico ajustando analiticamente un sector circular real.
-    Mantiene intacta la curvatura del arco inferior profundo.
+    Isolate the acoustic cone by fitting an analytical circular sector.
+
+    This preserves the curvature of the deeper lower arc instead of forcing a
+    rectangular crop around the entire frame.
     """
 
     def __init__(self) -> None:
@@ -350,7 +353,7 @@ class ROICropper:
 
 
 class PhysicalResampler:
-    """Redimensiona el cono usando un factor de escala basado en el FOV vertical."""
+    """Resize the acoustic cone using a scale factor from the vertical FOV."""
 
     def __init__(self, target_spacing: float = TARGET_SPACING_MM) -> None:
         self.target_spacing = target_spacing
@@ -382,8 +385,10 @@ class PhysicalResampler:
 
 class TileStandardizer:
     """
-    Aplica normalizacion robusta por percentiles excluyendo ceros
-    y centra la imagen en una matriz 256x256.
+    Apply robust percentile normalization and center the result in a 256x256 tile.
+
+    Zero-valued background pixels are excluded from the percentile estimate so
+    the acoustic signal determines the contrast range.
     """
 
     def __init__(self, size: int = IMAGE_SIZE) -> None:
@@ -445,7 +450,7 @@ class TileStandardizer:
 
 
 class OrientationModifier:
-    """Rota y espeja la matriz final para alinear su orientacion anatomica con MRI."""
+    """Rotate and mirror the final matrix to match the MRI anatomical orientation."""
 
     @staticmethod
     def align_with_mri(img: np.ndarray) -> np.ndarray:
@@ -455,7 +460,7 @@ class OrientationModifier:
 
 
 class BBoxDebugWriter:
-    """Guarda metadata JSON e imagen de control con bbox transformada."""
+    """Save transformed-bbox metadata and a visual debug image."""
 
     @staticmethod
     def draw_debug(image: np.ndarray, boxes: list[BBox], out_path: str) -> None:
@@ -596,14 +601,14 @@ class UltrasoundPipeline:
                 for p in glob(os.path.join(fov_dir, f"*{ext}"))
             ]
             if not paths:
-                log.warning("No se encontraron imagenes en: %s", fov_dir)
+                log.warning("No images found in: %s", fov_dir)
                 continue
             result[fov_name] = sorted(paths)
-            log.info("FOV %-5s -> %d imagenes encontradas.", fov_name, len(paths))
+            log.info("FOV %-5s -> %d images found.", fov_name, len(paths))
 
         if not result:
             raise FileNotFoundError(
-                f"No se encontraron imagenes en subcarpetas de: {self.base_path}"
+                f"No images were found in subfolders of: {self.base_path}"
             )
         return result
 
@@ -755,7 +760,7 @@ class UltrasoundPipeline:
                 all_paths.append(p)
                 path_to_fov[p] = fov_mm
 
-        log.info("Total de imagenes descubiertas: %d", len(all_paths))
+        log.info("Total discovered images: %d", len(all_paths))
 
         splits = self._splitter.split(all_paths)
         out_dirs = self._splitter.build_dirs()
@@ -796,7 +801,7 @@ class UltrasoundPipeline:
                 saved_count += 1
 
             total_stats[split_name] = saved_count
-            log.info("Split %-5s -> %d imagenes guardadas.", split_name, saved_count)
+            log.info("Split %-5s -> %d images saved.", split_name, saved_count)
 
         self._splitter.save_manifest(splits, saved_names)
 
@@ -806,7 +811,7 @@ class UltrasoundPipeline:
             log.info("    %-6s : %d archivos .npy", split_name, count)
         log.info("  Total   : %d archivos .npy", sum(total_stats.values()))
         if skipped_total:
-            log.warning("  Saltadas: %d imagenes por errores.", skipped_total)
+            log.warning("  Skipped: %d images due to errors.", skipped_total)
         log.info("=" * 60)
 
 

@@ -1,28 +1,30 @@
 """
-mri_pipeline.py
-===============
-Pipeline de preparación de datos MRI (NIfTI → .npy) para entrenamiento de
-Attention U-Net 2D con consistencia isométrica estricta (0.8 mm/px) y
-aislamiento estadístico absoluto (sin data leakage).
+MRI preprocessing pipeline for Attention U-Net training.
 
-Orden de ejecución:
-    1. División física a nivel de paciente (train/val/test)
-    2. Canonización de orientación (RAS)
-    3. Extracción 2D por el Eje 0 (plano sagital)
-    4. Filtrado por área mínima de máscara (≥ 150 px)
-    5. Resampling físico a 0.8 mm/px
-    6. Center Crop / Padding a 256 × 256
-    7. Guardado individual como .npy
+This script converts patient-level NIfTI volumes into 2-D `.npy` slices with
+strict physical consistency: 0.8 mm/px spacing and fixed 256 x 256 tiles.
+Patient-level train/validation/test splitting is performed before slice
+extraction to prevent data leakage.
 
-Uso:
-    python mri_pipeline.py
+Execution order:
+    1. Split patient folders into train/validation/test sets.
+    2. Canonicalize NIfTI orientation to RAS+.
+    3. Extract 2-D slices along axis 0, corresponding to sagittal slices after
+       canonicalization.
+    4. Keep slices whose mask area is at least 150 pixels.
+    5. Resample image and mask to 0.8 mm/px.
+    6. Center crop or pad each slice to 256 x 256.
+    7. Save each image/mask pair as `.npy`.
 
-Variables de entorno (opcional, con valores por defecto):
-    MRI_DATA_PATH      → carpeta raíz con subcarpetas de pacientes
-    MRI_OUTPUT_PATH    → carpeta de salida para los splits
-    NIFTI_IMG_SUFFIX   → sufijo del archivo imagen  (default: _t2)
-    NIFTI_MASK_SUFFIX  → sufijo del archivo máscara (default: _seg)
-    PROCESSOR_IMAGE_SIZE → lado del tile cuadrado final (default: 256)
+Usage:
+    python scripts/data_preparation/mri_pipeline.py
+
+Optional environment variables:
+    MRI_DATA_PATH          Root folder with one subfolder per patient.
+    MRI_OUTPUT_PATH        Output folder for processed splits.
+    NIFTI_IMG_SUFFIX       Image filename suffix, default `_t2`.
+    NIFTI_MASK_SUFFIX      Mask filename suffix, default `_seg`.
+    PROCESSOR_IMAGE_SIZE   Final square tile size, default 256.
 """
 
 from __future__ import annotations
@@ -76,30 +78,17 @@ def split_patients(
     random_state: int = RANDOM_STATE,
 ) -> dict[str, list[str]]:
     """
-    Divide los directorios de pacientes en train / val / test ANTES de
-    extraer ningún corte, garantizando que un mismo paciente no aparezca
-    jamás en dos splits distintos.
+    Split patient folders before extracting any slices.
 
-    Parámetros
-    ----------
-    base_path : str
-        Carpeta raíz que contiene una subcarpeta por paciente.
-    val_ratio : float
-        Fracción del total asignada a validación (default 0.10).
-    test_ratio : float
-        Fracción del total asignada a test (default 0.10).
-    random_state : int
-        Semilla para reproducibilidad.
-
-    Retorna
-    -------
-    dict con claves "train", "val", "test" y listas de rutas absolutas.
+    This guarantees that slices from the same patient can never appear in more
+    than one split, preserving statistical independence between train,
+    validation, and test sets.
     """
     all_folders: list[str] = sorted(
         f for f in glob(os.path.join(base_path, "*")) if os.path.isdir(f)
     )
     if not all_folders:
-        raise FileNotFoundError(f"No se encontraron subcarpetas en: {base_path}")
+        raise FileNotFoundError(f"No patient subfolders were found in: {base_path}")
 
     holdout_ratio = val_ratio + test_ratio
     train_folders, holdout_folders = train_test_split(
@@ -120,24 +109,14 @@ def split_patients(
     splits = {"train": train_folders, "val": val_folders, "test": test_folders}
 
     log.info(
-        "División de pacientes — train: %d | val: %d | test: %d",
+        "Patient split - train: %d | val: %d | test: %d",
         len(train_folders), len(val_folders), len(test_folders),
     )
     return splits
 
 
 def save_split_manifest(splits: dict[str, list[str]], output_path: str) -> None:
-    """
-    Exporta un JSON con los IDs de paciente asignados a cada split para
-    trazabilidad y reproducibilidad del experimento.
-
-    Parámetros
-    ----------
-    splits : dict
-        Resultado de split_patients().
-    output_path : str
-        Directorio raíz de salida; el JSON se guarda en su interior.
-    """
+    """Save patient IDs assigned to each split for traceability."""
     manifest = {
         split_name: [os.path.basename(p) for p in paths]
         for split_name, paths in splits.items()
@@ -146,16 +125,14 @@ def save_split_manifest(splits: dict[str, list[str]], output_path: str) -> None:
     os.makedirs(output_path, exist_ok=True)
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, ensure_ascii=False)
-    log.info("Manifiesto de splits guardado en: %s", manifest_path)
+    log.info("Saved split manifest to: %s", manifest_path)
 
 
 def build_output_dirs(output_path: str) -> dict[str, dict[str, str]]:
     """
-    Crea la estructura de carpetas de salida:
+    Create the output directory structure:
         <output_path>/<split>/images/
         <output_path>/<split>/masks/
-
-    Retorna un dict anidado con las rutas absolutas para uso posterior.
     """
     paths: dict[str, dict[str, str]] = {}
     for split_name in SPLITS:
@@ -171,28 +148,16 @@ def load_canonical_nifti(
     nifti_path: str,
 ) -> Optional[tuple[np.ndarray, nib.nifti1.Nifti1Header]]:
     """
-    Carga un archivo NIfTI y lo convierte a la orientación canónica RAS+
-    mediante `nib.as_closest_canonical`.
+    Load a NIfTI file and convert it to canonical RAS+ orientation.
 
-    Por qué RAS+ obligatorio
-    ------------------------
-    Los NIfTIs del mundo real pueden almacenarse en cualquier orientación
-    (LAS, PIR, etc.) dependiendo del escáner y el centro hospitalario.
-    Aplicar `as_closest_canonical` garantiza que el eje 0 siempre apunte
-    a Right, el eje 1 a Anterior y el eje 2 a Superior,
-    sin importar el origen del archivo.  Esto hace que el código sea
-    completamente independiente del equipo de adquisición y elimina
-    la necesidad de rotaciones manuales frágiles (rot90, fliplr), que son
-    propensas a errores silenciosos cuando la orientación original varía.
+    Real-world NIfTI files may be stored in different orientations depending on
+    scanner and institution. `nib.as_closest_canonical` makes axis 0 point to
+    Right, axis 1 to Anterior, and axis 2 to Superior. That removes the need for
+    fragile manual rotations or flips, which can silently fail when the original
+    orientation changes.
 
-    Parámetros
-    ----------
-    nifti_path : str
-        Ruta al archivo .nii o .nii.gz.
-
-    Retorna
-    -------
-    Tupla (array 3-D float32, header del NIfTI canonizado) o None si falla.
+    Returns:
+        `(data, header)` for the canonicalized image, or `None` if loading fails.
     """
     try:
         img = nib.load(nifti_path)
@@ -200,11 +165,11 @@ def load_canonical_nifti(
         data = img_canonical.get_fdata(dtype=np.float32)
         return data, img_canonical.header
     except Exception as exc:  # noqa: BLE001
-        log.warning("No se pudo cargar '%s': %s. Saltando...", nifti_path, exc)
+        log.warning("Could not load '%s': %s. Skipping...", nifti_path, exc)
         return None
 
 
-SAG_AXIS: int = 0  # Eje sagital tras canonizacion RAS+
+SAG_AXIS: int = 0  # Sagittal axis after RAS+ canonicalization.
 
 
 def extract_valid_slices(
@@ -213,27 +178,11 @@ def extract_valid_slices(
     min_mask_area: int = MIN_MASK_AREA_PX,
 ) -> list[tuple[int, np.ndarray, np.ndarray]]:
     """
-    Extrae todos los cortes 2D a lo largo del Eje 0 (SAG_AXIS) y retiene
-    únicamente los pares cuya máscara supera el umbral mínimo de área.
+    Extract 2-D sagittal slices and keep only slices with sufficient mask area.
 
-    Por qué Eje 0
-    ----------------------------
-    Tras la canonización RAS+, iterar sobre el eje 0 produce cortes 2D
-    `vol[i, :, :]`. Las dimensiones del plano resultante corresponden a los
-    ejes físicos 1 y 2, que son los spacings usados para el resampling.
-
-    Parámetros
-    ----------
-    vol_img : np.ndarray  (H, W, D)
-        Volumen de imagen MRI canonizado.
-    vol_seg : np.ndarray  (H, W, D)
-        Volumen de máscara de segmentación canonizado.
-    min_mask_area : int
-        Número mínimo de píxeles activos para conservar el corte.
-
-    Retorna
-    -------
-    Lista de tuplas (índice_corte, slice_imagen_2D, slice_máscara_2D).
+    After RAS+ canonicalization, iterating over axis 0 yields slices of the form
+    `vol[i, :, :]`. The in-plane dimensions are physical axes 1 and 2, which are
+    the spacings used for resampling.
     """
     valid: list[tuple[int, np.ndarray, np.ndarray]] = []
     n_slices = vol_img.shape[SAG_AXIS]
@@ -253,14 +202,12 @@ def get_inplane_spacings(
     header: nib.nifti1.Nifti1Header,
 ) -> tuple[float, float]:
     """
-    Extrae los spacings (mm/px) de los ejes en el plano del corte sagital
-    (Eje 1 y Eje 2 del volumen canonizado) directamente del header NIfTI.
+    Read sagittal in-plane spacings from the canonicalized NIfTI header.
 
-    Retorna
-    -------
-    (spacing_row, spacing_col) en mm/px.
+    Returns:
+        `(spacing_row, spacing_col)` in mm/px.
     """
-    # Los cortes son vol[i, :, :] -> dimensiones en el plano son ejes 1 y 2.
+    # Slices are vol[i, :, :], so in-plane dimensions are axes 1 and 2.
     pixdim = header.get_zooms()
     return float(pixdim[1]), float(pixdim[2])
 
@@ -273,37 +220,17 @@ def resample_slice(
     target_spacing: float = TARGET_SPACING_MM,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Redimensiona un par imagen/máscara para que 1 px ≡ target_spacing mm.
+    Resize an image/mask pair so one pixel represents `target_spacing` mm.
 
-    Cálculo de nuevas dimensiones
-    ------------------------------
-        tamaño_físico_mm = dim_px * spacing_mm_px
-        nueva_dim_px     = round(tamaño_físico_mm / target_spacing)
+    New dimensions are computed from physical size:
+        physical_size_mm = dim_px * spacing_mm_px
+        new_dim_px = round(physical_size_mm / target_spacing)
 
-    Elección de interpolación
-    -------------------------
-    - Imagen  → INTER_CUBIC (bicúbico):
-        La señal MRI es continua y suave.  La interpolación bicúbica preserva
-        los gradientes de intensidad sin introducir aliasing perceptible,
-        lo que es crítico para que la red aprenda texturas reales.
-
-    - Máscara → INTER_NEAREST (vecino más cercano):
-        La máscara es un mapa binario (0/1).  Cualquier interpolación
-        que genere valores intermedios (0.3, 0.7…) corrompería las etiquetas
-        al redondear o binarizar después.  INTER_NEAREST garantiza bordes
-        nítidos y clases puras, preservando la integridad del ground truth.
-
-    Parámetros
-    ----------
-    img_slice : np.ndarray 2-D   – corte de imagen normalizado.
-    seg_slice : np.ndarray 2-D   – corte de máscara.
-    spacing_row : float          – resolución física original del eje de filas (mm/px).
-    spacing_col : float          – resolución física original del eje de columnas (mm/px).
-    target_spacing : float       – resolución física objetivo (mm/px).
-
-    Retorna
-    -------
-    (img_resampled, seg_resampled) como float32.
+    Interpolation choices:
+      - Image: INTER_CUBIC. MRI intensity is continuous, and cubic interpolation
+        preserves smooth gradients without obvious aliasing.
+      - Mask: INTER_NEAREST. The mask is binary; intermediate values would
+        corrupt labels after rounding or thresholding.
     """
     h_px, w_px = img_slice.shape
 
@@ -316,12 +243,12 @@ def resample_slice(
     img_res = cv2.resize(
         img_slice.astype(np.float32),
         (new_w, new_h),
-        interpolation=cv2.INTER_CUBIC,      # suaviza sin aliasing
+        interpolation=cv2.INTER_CUBIC,
     )
     seg_res = cv2.resize(
         seg_slice.astype(np.float32),
         (new_w, new_h),
-        interpolation=cv2.INTER_NEAREST,    # preserva etiquetas binarias
+        interpolation=cv2.INTER_NEAREST,
     )
     return img_res, seg_res
 
@@ -332,28 +259,12 @@ def pad_or_crop_center(
     target_w: int = IMAGE_SIZE,
 ) -> np.ndarray:
     """
-    Lleva un array 2-D a (target_h, target_w) sin deformar ni escalar
-    el contenido:
+    Convert a 2-D array to the target shape without scaling or distortion.
 
-    - Si la dimensión es MENOR que el objetivo → padding de ceros centrado.
-    - Si la dimensión es MAYOR que el objetivo → recorte central.
-
-    Esta operación garantiza que 1 px sigue equivaliendo a TARGET_SPACING_MM mm
-    después del resampling, ya que NO altera la resolución física.
-
-    La misma función se aplica a imagen y máscara con idénticos parámetros,
-    asegurando alineación perfecta entre ambos arrays.
-
-    Parámetros
-    ----------
-    arr : np.ndarray 2-D
-        Array a ajustar.
-    target_h, target_w : int
-        Dimensiones finales deseadas.
-
-    Retorna
-    -------
-    np.ndarray de forma (target_h, target_w) con el mismo dtype que arr.
+    Smaller dimensions are centered with zero padding. Larger dimensions are
+    center-cropped. Because this step happens after physical resampling, it does
+    not change the mm/px resolution. The same crop/pad operation is applied to
+    image and mask, preserving their alignment.
     """
     h, w = arr.shape
     out = np.zeros((target_h, target_w), dtype=arr.dtype)
@@ -382,16 +293,9 @@ def pad_or_crop_center(
 
 def normalize_minmax(img: np.ndarray) -> np.ndarray:
     """
-    Normaliza un array al rango [0, 1] usando Min-Max scaling.
-    Si el rango es cero (corte completamente negro), retorna el array tal cual.
+    Normalize an image to [0, 1] with min-max scaling.
 
-    Parámetros
-    ----------
-    img : np.ndarray   – imagen MRI en unidades de intensidad originales.
-
-    Retorna
-    -------
-    np.ndarray float32 con valores en [0.0, 1.0].
+    If the intensity range is zero, return the image as float32 unchanged.
     """
     vmin, vmax = float(img.min()), float(img.max())
     diff = vmax - vmin
@@ -402,36 +306,19 @@ def normalize_minmax(img: np.ndarray) -> np.ndarray:
 
 class MRIPipelineProcessor:
     """
-    Orquesta el pipeline completo de preparación de datos MRI NIfTI → .npy.
+    Orchestrate the complete MRI NIfTI-to-`.npy` preprocessing pipeline.
 
-    Orden de ejecución:
-        1. División física a nivel de paciente  (sin data leakage)
-        2. Creación de directorios de salida
-        3. Exportación del manifiesto JSON
-        4. Para cada split y cada paciente:
-            a. Carga y canonización RAS+
-            b. Extracción y filtrado de cortes 2D
-            c. Normalización Min-Max
-            d. Resampling físico a 0.8 mm/px
-            e. Center Crop / Padding a 256×256
-            f. Guardado como .npy individual
-
-    Parámetros
-    ----------
-    base_path : str
-        Carpeta raíz con subcarpetas de pacientes.
-    output_path : str
-        Carpeta raíz de salida para los splits.
-    img_suffix : str
-        Sufijo del archivo imagen (e.g. '_t2').
-    mask_suffix : str
-        Sufijo del archivo máscara (e.g. '_seg').
-    image_size : int
-        Lado del tile cuadrado final en píxeles.
-    target_spacing : float
-        Resolución física objetivo en mm/px.
-    min_mask_area : int
-        Área mínima de máscara en píxeles para conservar un corte.
+    Execution order:
+        1. Patient-level split without leakage.
+        2. Output directory creation.
+        3. Split-manifest export.
+        4. Per-patient processing:
+            a. Load and canonicalize to RAS+.
+            b. Extract and filter 2-D slices.
+            c. Apply min-max normalization.
+            d. Resample to 0.8 mm/px.
+            e. Center crop or pad to 256 x 256.
+            f. Save individual `.npy` image/mask pairs.
     """
 
     def __init__(
@@ -453,10 +340,7 @@ class MRIPipelineProcessor:
         self.min_mask_area = min_mask_area
 
     def _find_nifti(self, folder: str, suffix: str) -> Optional[str]:
-        """
-        Busca el primer archivo .nii o .nii.gz cuyo nombre termina en `suffix`.
-        Retorna la ruta o None si no existe.
-        """
+        """Return the first `.nii` or `.nii.gz` file ending in `suffix`."""
         matches = glob(os.path.join(folder, f"*{suffix}.nii*"))
         return matches[0] if matches else None
 
@@ -466,18 +350,10 @@ class MRIPipelineProcessor:
         out_dirs: dict[str, str],
     ) -> int:
         """
-        Procesa todos los cortes válidos de un único paciente y los guarda.
+        Process all valid slices from one patient folder.
 
-        Parámetros
-        ----------
-        folder : str
-            Ruta a la carpeta del paciente.
-        out_dirs : dict
-            Sub-diccionario {'images': ruta, 'masks': ruta} para el split.
-
-        Retorna
-        -------
-        Número de cortes guardados (0 si el paciente fue saltado).
+        Returns:
+            Number of saved slices, or zero if the patient is skipped.
         """
         patient_id = os.path.basename(folder)
 
@@ -485,21 +361,21 @@ class MRIPipelineProcessor:
         seg_path = self._find_nifti(folder, self.mask_suffix)
 
         if img_path is None or seg_path is None:
-            log.warning("Paciente '%s': falta imagen o máscara. Saltando.", patient_id)
+            log.warning("Patient '%s': missing image or mask. Skipping.", patient_id)
             return 0
 
         result_img = load_canonical_nifti(img_path)
         result_seg = load_canonical_nifti(seg_path)
 
         if result_img is None or result_seg is None:
-            return 0  # error ya logueado dentro de load_canonical_nifti
+            return 0
 
         vol_img, header = result_img
         vol_seg, _ = result_seg
 
         if vol_img.shape != vol_seg.shape:
             log.warning(
-                "Paciente '%s': imagen %s y máscara %s tienen formas distintas. Saltando.",
+                "Patient '%s': image %s and mask %s have different shapes. Skipping.",
                 patient_id, vol_img.shape, vol_seg.shape,
             )
             return 0
@@ -522,7 +398,7 @@ class MRIPipelineProcessor:
             img_out = pad_or_crop_center(img_res, self.image_size, self.image_size)
             seg_out = pad_or_crop_center(seg_res, self.image_size, self.image_size)
 
-            # Evita etiquetas fraccionales tras resize/crop.
+            # Restore binary labels after resize and crop/pad.
             seg_out = (seg_out > 0).astype(np.float32)
 
             file_id = f"{patient_id}_sag_{slice_idx}"
@@ -539,16 +415,13 @@ class MRIPipelineProcessor:
         return saved_count
 
     def run(self) -> None:
-        """
-        Ejecuta el pipeline completo en el orden definido.
-        Loguea estadísticas de cortes guardados por split al finalizar.
-        """
-        log.info("═" * 60)
-        log.info("  MRI Pipeline — Inicio de procesamiento")
+        """Run the full pipeline and log saved-slice counts per split."""
+        log.info("=" * 60)
+        log.info("  MRI Pipeline - start")
         log.info("  Base path : %s", self.base_path)
         log.info("  Output    : %s", self.output_path)
         log.info("  Spacing   : %.1f mm/px  |  Tile: %d px", self.target_spacing, self.image_size)
-        log.info("═" * 60)
+        log.info("=" * 60)
 
         splits = split_patients(
             self.base_path,
@@ -563,22 +436,22 @@ class MRIPipelineProcessor:
 
         for split_name, folders in splits.items():
             split_slices = 0
-            desc = f"[{split_name.upper():5s}] Procesando pacientes"
+            desc = f"[{split_name.upper():5s}] Processing patients"
 
-            for folder in tqdm(folders, desc=desc, unit="paciente"):
+            for folder in tqdm(folders, desc=desc, unit="patient"):
                 saved = self._process_patient(folder, out_dirs[split_name])
                 split_slices += saved
 
             total_stats[split_name] = split_slices
-            log.info("Split %-5s → %d cortes guardados", split_name, split_slices)
+            log.info("Split %-5s -> %d saved slices", split_name, split_slices)
 
-        log.info("─" * 60)
-        log.info("  RESUMEN FINAL")
+        log.info("-" * 60)
+        log.info("  FINAL SUMMARY")
         for split_name, count in total_stats.items():
-            log.info("    %-6s : %d cortes .npy", split_name, count)
-        log.info("  Total   : %d cortes .npy", sum(total_stats.values()))
-        log.info("═" * 60)
-        log.info("  Pipeline completado. Datos listos en: %s", self.output_path)
+            log.info("    %-6s : %d .npy slices", split_name, count)
+        log.info("  Total   : %d .npy slices", sum(total_stats.values()))
+        log.info("=" * 60)
+        log.info("  Pipeline completed. Data ready in: %s", self.output_path)
 
 
 if __name__ == "__main__":

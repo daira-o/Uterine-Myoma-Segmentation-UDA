@@ -1,9 +1,9 @@
 """
-scripts/training/train_target.py
-Entrenamiento target MRI -> US para la Attention U-Net.
+Target adaptation training from MRI to ultrasound for Attention U-Net.
 
-Prioriza segmentacion supervisada MRI y supervision debil US. DANN queda
-disponible como regularizador opcional, apagado por defecto:
+The objective prioritizes supervised MRI segmentation and weakly supervised
+ultrasound adaptation. DANN remains available as an optional regularizer and is
+disabled by default:
     total = lambda_mri * seg_loss_mri
           + lambda_us * weak_loss_us
           + lambda_domain * domain_loss
@@ -60,11 +60,12 @@ WEAK_LOSS_TYPES = ("soft_bbox", "legacy_bbox")
 
 class UltrasoundDataset(Dataset):
     """
-    Dataset target weak.
+    Weakly supervised ultrasound target dataset.
 
-    Devuelve imagen US, target weak y bbox-mask. En modo bbox, target weak y
-    bbox-mask son iguales. En modo pseudomask, target weak viene de una mascara
-    pseudo y bbox-mask se mantiene para metricas bbox_in/IoU.
+    Returns the ultrasound image, the weak target, and the bbox mask. In `bbox`
+    mode, the weak target and bbox mask are identical. In `pseudomask` mode, the
+    weak target comes from a pseudo-mask while the bbox mask is preserved for
+    bbox-in/IoU metrics.
     """
 
     def __init__(
@@ -110,7 +111,7 @@ class UltrasoundDataset(Dataset):
     def _bbox_mask(self, img_path: str) -> np.ndarray:
         json_path = self.bbox_json_path(img_path)
         if not json_path.exists():
-            raise FileNotFoundError(f"No existe bbox JSON para US: {json_path}")
+            raise FileNotFoundError(f"Missing bbox JSON for US image: {json_path}")
 
         rows = self.load_bbox_rows(json_path)
         if not rows:
@@ -134,8 +135,8 @@ class UltrasoundDataset(Dataset):
         mask_path = self.pseudomask_path(img_path)
         if not mask_path.exists():
             raise FileNotFoundError(
-                "No existe pseudomask para US: "
-                f"{mask_path}. Esperado en pseudomasks/, pseudo_masks/ o masks/."
+                "Missing US pseudomask: "
+                f"{mask_path}. Expected under pseudomasks/, pseudo_masks/, or masks/."
             )
         mask = np.load(mask_path).astype(np.float32)
         if mask.ndim == 2:
@@ -162,7 +163,7 @@ def load_us_image_paths(
     require_bboxes: bool = True,
     weak_mode: str = "bbox",
 ) -> list[str]:
-    """Carga imagenes US desde <base_path>/<split>/images/*.npy, con bbox asociada."""
+    """Load ultrasound images from `<base_path>/<split>/images/*.npy` with bboxes."""
     img_dir = os.path.join(base_path, split, "images")
     imgs = sorted(glob.glob(os.path.join(img_dir, "*.npy")))
     if not imgs:
@@ -192,25 +193,25 @@ def load_us_image_paths(
         imgs = usable
         if not imgs:
             raise FileNotFoundError(
-                f"No se encontraron imagenes US validas para weak_mode={weak_mode} en '{img_dir}'."
+                f"No valid US images were found for weak_mode={weak_mode} in '{img_dir}'."
             )
         if skipped:
-            log.warning("Split US %-5s -> %d imagenes omitidas sin bbox valida.", split, skipped)
+            log.warning("US split %-5s -> %d images skipped without valid bbox.", split, skipped)
 
-    log.info("Split US %-5s -> %d imagenes cargadas.", split, len(imgs))
+    log.info("US split %-5s -> %d images loaded.", split, len(imgs))
     return imgs
 
 
 def get_us_base_path() -> str:
     """
-    Prioriza el dataset curado porque la limpieza visual debe ocurrir antes
-    del split final. Se puede sobreescribir con US_READY_PATH sin tocar config.py.
+    Prefer the curated dataset because visual cleaning should happen before the
+    final split. `US_READY_PATH` can override this without editing `config.py`.
     """
     return CONFIG.get("us_ready_path") or os.path.join(str(ROOT), "data_ready_US")
 
 
 def set_decoder_trainable(model: DANNUNet, trainable: bool) -> None:
-    """Congela/descongela solo decoder + salida; encoder y discriminator siguen activos."""
+    """Freeze or unfreeze only the decoder and output layer."""
     decoder_modules = [
         model.segmenter.gate4,
         model.segmenter.gate3,
@@ -236,7 +237,7 @@ def set_decoder_trainable(model: DANNUNet, trainable: bool) -> None:
 
 
 def build_optimizer(model: DANNUNet) -> torch.optim.Optimizer:
-    """Param groups con LR diferenciado para encoder, decoder y discriminator."""
+    """Build parameter groups with separate learning rates by model region."""
     base_lr = CONFIG["lr"]
     encoder_lr = CONFIG.get("dann_encoder_lr", base_lr * 0.1)
     decoder_lr = CONFIG.get("dann_decoder_lr", base_lr * 0.05)
@@ -281,11 +282,12 @@ def weak_bbox_loss(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    Supervision debil por bbox.
+    Weak bbox supervision.
 
-    - Penaliza probabilidad fuera del rectangulo.
-    - Dentro del rectangulo usa una loss tipo MIL sobre los pixeles mas activos.
-      Asi se incentiva localizar lesion sin convertir toda la bbox en mascara.
+    - Penalizes probability outside the rectangle.
+    - Inside the rectangle, applies a MIL-like loss over the most active pixels.
+      This encourages lesion localization without treating the whole bbox as a
+      segmentation mask.
     """
     probs = torch.sigmoid(seg_logits.float())
     bbox_mask = bbox_mask.float()
@@ -310,7 +312,7 @@ def weak_bbox_loss(
 
 
 def expand_bbox_mask(bbox_mask: torch.Tensor, margin_px: int) -> torch.Tensor:
-    """Expande una bbox-mask binaria sin usarla como clipping duro."""
+    """Expand a binary bbox mask without using it as a hard clipping mask."""
     bbox_mask = (bbox_mask.float() > 0.5).float()
     if margin_px <= 0:
         return bbox_mask
@@ -344,11 +346,12 @@ def soft_bbox_loss(
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Supervision debil suave por bbox unica.
+    Soft weak supervision from a single bbox.
 
-    - bbox original: incentiva presencia positiva, sin exigir llenar la caja.
-    - bbox expandida: zona permitida.
-    - fuera de bbox expandida: penalizacion principal contra activaciones.
+    - Original bbox: encourages positive evidence without requiring the model to
+      fill the entire box.
+    - Expanded bbox: defines a soft allowed region.
+    - Outside the expanded bbox: applies the main penalty against activations.
     """
     probs = torch.sigmoid(pred_logits.float())
     bbox_mask = (bbox_mask.float() > 0.5).float()
@@ -403,9 +406,9 @@ def soft_bbox_loss(
     topk_inside_prob = torch.stack(topk_inside_probs)
     mean_high_conf = torch.stack(mean_high_confs)
 
-    # Una mascara vacia tiene area 0. Si solo penalizamos exceso de area,
-    # la solucion vacia puede volverse optima cuando outside_loss domina.
-    # Esta banda penaliza mascaras demasiado chicas y demasiado grandes.
+    # An empty mask has area 0. If only excess area is penalized, the empty
+    # solution can become optimal when outside_loss dominates. This band
+    # penalizes masks that are too small as well as masks that are too large.
     pred_area = probs.sum(dim=(1, 2, 3))
     bbox_area = bbox_mask.sum(dim=(1, 2, 3)).clamp_min(1.0)
     predicted_area_ratio = pred_area / bbox_area
@@ -515,7 +518,7 @@ def compute_us_bbox_metrics(
     threshold: float,
     eps: float = 1e-6,
 ) -> dict[str, float]:
-    """Metricas weak US contra el rectangulo, no contra una mascara real."""
+    """Compute weak US metrics against the bbox rectangle, not a true mask."""
     pred = (torch.sigmoid(seg_logits.detach()) >= threshold).float()
     bbox = (bbox_mask.detach() > 0.5).float()
 
@@ -562,7 +565,7 @@ def validate_mri(
     val_loader: DataLoader,
     device: torch.device,
 ) -> tuple[dict, int, float]:
-    """Validacion MRI: loss de segmentacion + metricas heredadas de Fase 1."""
+    """Validate on MRI with segmentation loss and inherited phase-1 metrics."""
     model.eval()
     batch_losses, batch_dices, batch_hd95s, batch_oprecs = [], [], [], []
     inf_count = 0
@@ -796,7 +799,7 @@ def init_target_metrics_csv(run_id: str) -> str:
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             csv.writer(fh).writerow(_CSV_HEADER)
-        log.info("Metricas target -> %s (archivo nuevo)", csv_path)
+        log.info("Target metrics -> %s (new file)", csv_path)
     else:
         with open(csv_path, "r", newline="", encoding="utf-8") as fh:
             existing_header = next(csv.reader(fh), [])
@@ -808,7 +811,7 @@ def init_target_metrics_csv(run_id: str) -> str:
             )
             with open(csv_path, "w", newline="", encoding="utf-8") as fh:
                 csv.writer(fh).writerow(_CSV_HEADER)
-            log.warning("Header CSV previo incompatible; metricas nuevas -> %s", csv_path)
+            log.warning("Previous CSV header is incompatible; writing new metrics -> %s", csv_path)
         else:
             log.info("Metricas target -> %s (append)", csv_path)
     return csv_path
@@ -952,7 +955,7 @@ def load_phase1_checkpoint(model: DANNUNet, device: torch.device) -> None:
     )
     log.info("Checkpoint Fase 1 cargado en DANNUNet.segmenter -> %s", checkpoint_path)
     if missing:
-        log.warning("Pesos faltantes al cargar segmenter: %s", missing)
+        log.warning("Missing weights while loading segmenter: %s", missing)
     if unexpected:
         log.warning("Pesos inesperados ignorados: %s", unexpected)
 
@@ -1163,9 +1166,9 @@ def run_epoch(
     log_every: int = 10,
 ) -> tuple[dict[str, float], float]:
     model.train()
-    # En target adaptation el dominio limitante es US: las imagenes target son
-    # pocas y tienen supervision weak. La epoca debe quedar definida por US
-    # para evitar reciclarlo muchas veces contra todos los batches MRI.
+    # In target adaptation, ultrasound is the limiting domain: target images are
+    # fewer and only weakly supervised. Define the epoch by US so those samples
+    # are not recycled repeatedly against every MRI batch.
     mri_iter = cycle(mri_loader)
     us_iter = cycle(us_loader)
     steps_per_epoch = max(1, int(steps_per_epoch))
@@ -1359,7 +1362,7 @@ def run_epoch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Entrena target MRI->US con MRI fuerte, US weak y DANN suave."
+        description="Train MRI-to-US target adaptation with supervised MRI, weak US, and optional DANN."
     )
     parser.add_argument(
         "--lambda_mri",
@@ -1377,13 +1380,13 @@ def parse_args() -> argparse.Namespace:
         "--lambda_domain",
         type=float,
         default=float(CONFIG.get("lambda_domain", 0.0)),
-        help="Peso para regularizacion adversarial DANN. Default: 0.0.",
+        help="Weight for adversarial DANN regularization. Default: 0.0.",
     )
     parser.add_argument(
         "--use_dann",
         action=argparse.BooleanOptionalAction,
         default=bool(CONFIG.get("use_dann", True)),
-        help="Activa/desactiva el termino DANN sin cambiar la arquitectura.",
+        help="Enable or disable the DANN term without changing the architecture.",
     )
     parser.add_argument(
         "--weak_mode",
@@ -1395,7 +1398,7 @@ def parse_args() -> argparse.Namespace:
         "--weak_loss_type",
         choices=WEAK_LOSS_TYPES,
         default=str(CONFIG.get("weak_loss_type", "soft_bbox")),
-        help="Loss para weak_mode=bbox: soft_bbox nueva o legacy_bbox previa.",
+        help="Loss for weak_mode=bbox: new soft_bbox or previous legacy_bbox.",
     )
     parser.add_argument("--bbox_margin_px", type=int, default=int(CONFIG.get("weak_bbox_margin_px", 8)))
     parser.add_argument("--outside_weight", type=float, default=float(CONFIG.get("weak_outside_weight", 1.0)))
@@ -1450,25 +1453,25 @@ def parse_args() -> argparse.Namespace:
         "--weak_debug_max_batches",
         type=int,
         default=int(CONFIG.get("weak_debug_max_batches", 1)),
-        help="Maximo de batches US por epoca para guardar debug visual.",
+        help="Maximum US batches per epoch for visual debug output.",
     )
     parser.add_argument(
         "--weak_debug_max_samples",
         type=int,
         default=int(CONFIG.get("weak_debug_max_samples", 1)),
-        help="Maximo de samples US por batch para guardar debug visual.",
+        help="Maximum US samples per batch for visual debug output.",
     )
     parser.add_argument(
         "--us_metric_thresholds",
         type=str,
         default=",".join(str(v) for v in CONFIG.get("us_metric_thresholds", [0.30, 0.35, 0.40, 0.50])),
-        help="Thresholds separados por coma para metricas US de debug.",
+        help="Comma-separated thresholds for US debug metrics.",
     )
     parser.add_argument(
         "--target_steps_per_epoch",
         type=int,
         default=int(CONFIG.get("target_steps_per_epoch", 0)),
-        help="Steps por epoca target. <=0 usa len(us_loader) para ver US una vez por epoca.",
+        help="Target steps per epoch. <=0 uses len(us_loader) to see US once per epoch.",
     )
     return parser.parse_args()
 
@@ -1600,14 +1603,14 @@ def train(args: argparse.Namespace | None = None) -> None:
     log_split_diagnostics(tr_imgs, "train")
     log_split_diagnostics(val_imgs, "val")
     log.info(
-        "US train: %d imagenes | US val: %d imagenes | base: %s",
+        "US train: %d images | US val: %d images | base: %s",
         len(us_train_imgs),
         len(us_val_imgs),
         us_base_path,
     )
     log.info(
-        "Dataloaders simultaneos: la epoca target se gobierna por US y se usa cycle(MRI). "
-        "Asi US se ve aproximadamente una vez por epoca y MRI aporta supervision fuerte."
+        "Simultaneous dataloaders: the target epoch is governed by US and uses cycle(MRI). "
+        "This sees US approximately once per epoch while MRI supplies strong supervision."
     )
 
     num_workers = CONFIG.get("num_workers", 0)
@@ -1669,7 +1672,7 @@ def train(args: argparse.Namespace | None = None) -> None:
 
     if freeze_decoder_epochs > 0:
         set_decoder_trainable(model, False)
-        log.info("Decoder congelado por %d epoca(s).", freeze_decoder_epochs)
+        log.info("Decoder frozen for %d epoch(s).", freeze_decoder_epochs)
 
     optimizer = build_optimizer(model)
     scheduler = ReduceLROnPlateau(
@@ -1698,7 +1701,7 @@ def train(args: argparse.Namespace | None = None) -> None:
     total_steps = CONFIG["epochs"] * steps_per_epoch
     global_step = 0
     log.info(
-        "Steps target por epoca: %d (MRI batches=%d | US batches=%d | target_steps_per_epoch=%d)",
+        "Target steps per epoch: %d (MRI batches=%d | US batches=%d | target_steps_per_epoch=%d)",
         steps_per_epoch,
         len(mri_train_loader),
         len(us_train_loader),
@@ -1710,7 +1713,7 @@ def train(args: argparse.Namespace | None = None) -> None:
 
         if freeze_decoder_epochs > 0 and epoch == freeze_decoder_epochs + 1:
             set_decoder_trainable(model, True)
-            log.info("Decoder descongelado desde la epoca %d.", epoch)
+            log.info("Decoder unfrozen from epoch %d.", epoch)
 
         train_stats, alpha = run_epoch(
             model=model,
@@ -1735,7 +1738,7 @@ def train(args: argparse.Namespace | None = None) -> None:
         val_metrics, inf_batches, val_loss = validate_mri(model, mri_val_loader, device)
         val_us_metrics = validate_us_weak(model, us_val_loader, device, weak_mode)
         if inf_batches > 0:
-            log.warning("HD95=inf en %d batch(es) de validacion.", inf_batches)
+            log.warning("HD95=inf in %d validation batch(es).", inf_batches)
 
         dice_val = val_metrics["Dice"]
         target_score, val_area_score = compute_target_score(val_us_metrics, dice_val)

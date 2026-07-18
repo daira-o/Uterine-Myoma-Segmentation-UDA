@@ -138,7 +138,7 @@ def copy_split_files(
         shutil.rmtree(output_root)
     elif output_root.exists() and any(output_root.rglob("*.npy")):
         raise FileExistsError(
-            f"{output_root} ya contiene .npy. Usa --overwrite para recrearlo."
+            f"{output_root} already contains .npy files. Use --overwrite to rebuild it."
         )
 
     copied: dict[str, list[dict[str, str]]] = {}
@@ -213,7 +213,7 @@ def parse_args() -> argparse.Namespace:
         "--split-by",
         choices=("auto", "patient", "file"),
         default="auto",
-        help="auto intenta paciente y cae a archivo si no puede inferirlo.",
+        help="auto tries patient-level splitting and falls back to file-level splitting if needed.",
     )
     parser.add_argument(
         "--overwrite",
@@ -233,7 +233,7 @@ def main() -> None:
     split_by_patient = args.split_by in {"auto", "patient"}
     units, split_unit = build_units(files, split_by_patient=split_by_patient)
     if args.split_by == "patient" and split_unit != "patient":
-        raise ValueError("No se pudo inferir paciente para todos los archivos.")
+        raise ValueError("Could not infer patient IDs for all files.")
 
     splits = assign_units(units, ratios, args.random_state)
     copied = copy_split_files(splits, clean_root, output_root, args.overwrite)
